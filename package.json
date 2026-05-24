@@ -1,0 +1,33 @@
+{
+  "name": "streamline-mcp",
+  "version": "0.4.0",
+  "private": true,
+  "description": "MCP server that lets Claude read and edit a Streamline vendor account through the same /vendor/v1 API the mobile app uses. Ships in two flavours: stdio (Claude Desktop, single-vendor) and HTTP+OAuth (claude.ai custom connector, multi-vendor).",
+  "type": "module",
+  "bin": {
+    "streamline-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js",
+    "start:http": "node dist/http-server.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "axios": "^1.7.7",
+    "better-sqlite3": "^11.3.0",
+    "express": "^4.21.1",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.7.4",
+    "typescript": "^5.6.3"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

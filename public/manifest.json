@@ -1,0 +1,17 @@
+{
+  "name": "Streamline Vendor",
+  "short_name": "Streamline",
+  "description": "Manage your Streamline vendor account: bookings, services, employees, reports.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0F1F35",
+  "theme_color": "#0F1F35",
+  "icons": [
+    { "src": "/favicon-16.png",  "type": "image/png", "sizes": "16x16",   "purpose": "any" },
+    { "src": "/favicon-32.png",  "type": "image/png", "sizes": "32x32",   "purpose": "any" },
+    { "src": "/favicon-64.png",  "type": "image/png", "sizes": "64x64",   "purpose": "any" },
+    { "src": "/favicon-128.png", "type": "image/png", "sizes": "128x128", "purpose": "any" },
+    { "src": "/apple-touch-icon.png", "type": "image/png", "sizes": "180x180", "purpose": "any" },
+    { "src": "/logo.png", "type": "image/png", "sizes": "512x512", "purpose": "any maskable" }
+  ]
+}
