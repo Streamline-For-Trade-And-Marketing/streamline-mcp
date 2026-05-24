@@ -39,9 +39,17 @@ ENV NODE_ENV=production \
     PORT=3000 \
     MCP_DB_PATH=/app/data/mcp.sqlite
 
+# `curl` is needed for Coolify's external healthcheck (it shells into
+# the container and runs `curl http://localhost:3000/health` — there
+# is no Node-based fallback in the Coolify probe pipeline). Without
+# it, every healthcheck attempt logs `sh: 1: curl: not found` and the
+# container is marked unhealthy even though the app is actually
+# listening. Adds ~1MB to the image.
 # Drop root — the container only needs to read its app dir and
 # write to /app/data (mounted as a Coolify volume in prod).
-RUN useradd --system --uid 10001 --create-home mcp && \
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/* && \
+    useradd --system --uid 10001 --create-home mcp && \
     mkdir -p /app/data && \
     chown -R mcp:mcp /app
 
