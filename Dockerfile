@@ -13,7 +13,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY package.json package-lock.json* ./
-RUN npm ci
+# `--include=dev` is REQUIRED here. Coolify (and most orchestrators)
+# inject NODE_ENV=production as a build-time env var so the runtime
+# stage gets the right setting. When NODE_ENV=production is in scope,
+# `npm ci` quietly skips devDependencies — which means `typescript`
+# (and therefore `tsc`) never gets installed, and `npm run build` dies
+# with `sh: 1: tsc: not found`. The explicit flag overrides NODE_ENV
+# for this single command and guarantees the build toolchain lands.
+# The final image is unaffected: `npm prune --omit=dev` below strips
+# devDeps after the JS is compiled.
+RUN npm ci --include=dev
 
 COPY tsconfig.json ./
 COPY src ./src
