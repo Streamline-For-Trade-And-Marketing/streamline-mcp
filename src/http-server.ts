@@ -73,7 +73,7 @@ app.use((req, _res, next) => {
     : 'auth=(none)';
   // eslint-disable-next-line no-console
   console.error(
-    `[req] ${req.method} ${req.path} ua="${(req.headers['user-agent'] || '').slice(0, 60)}" ${auth} ct=${req.headers['content-type'] || '-'}`,
+    `[req] ${req.method} ${req.path} ua="${(req.headers['user-agent'] || '').slice(0, 60)}" ${auth} ct=${req.headers['content-type'] || '-'} accept=${req.headers.accept || '-'}`,
   );
   next();
 });
@@ -259,101 +259,41 @@ async function mcpHandler(req: Request, res: Response): Promise<void> {
     `[mcp] ${req.method} ${req.path} method=${(req.body as any)?.method ?? '(none)'}`,
   );
 
-  const base = publicBaseUrl(req);
-
-  // Short-circuit `initialize` so we can ship the SEP-973 `icons[]`
-  // array (which the MCP SDK's strict Zod schema would otherwise
-  // strip in the default Server.connect() pipeline). Use the schema
-  // shape per @modelcontextprotocol/sdk@1.29.0:
-  //
-  //   ImplementationSchema = {
-  //     name, title?, version,
-  //     icons?: [{ src, mimeType?, sizes?: string[] }],
-  //     websiteUrl?, description?
-  //   }
-  //
-  // PREVIOUS BUG: we shipped a singular `icon: <url>` field as a
-  // workaround for an old claude.ai behaviour. That field is NOT in
-  // the SDK schema. Some claude.ai builds run strict schema validation
-  // on the initialize response — and we suspect that's what's been
-  // failing with `Authorization with the MCP server failed`: the
-  // OAuth dance completes (logs confirm), then Claude rejects the
-  // first /mcp response and bails before a second call. Switched
-  // to the spec-defined `icons[]` array exclusively. If we ever need
-  // both, add `icon` alongside — never instead of.
-  //
-  // Rules of engagement:
-  //   1. Match the SDK's response shape EXACTLY.
-  //   2. Keep the response small (<1KB) — claude.ai rejected a 32KB
-  //      base64 payload with a JSON-Schema validation error.
-  //   3. `sizes` is an ARRAY of strings ("512x512"), never a single
-  //      string — that triggers Zod validation errors.
-  const body = req.body as any;
-  if (body?.method === 'initialize' && typeof body?.id !== 'undefined') {
-    const clientProto = body?.params?.protocolVersion;
-    // SUPPORTED_PROTOCOL_VERSIONS in @modelcontextprotocol/sdk@1.29.0
-    // = ['2025-11-25','2025-06-18','2025-03-26','2024-11-05','2024-10-07'].
-    // Echo the client's version when supported; otherwise reply with
-    // the latest WE know so the client can decide to disconnect.
-    const supported = [
-      '2025-11-25',
-      '2025-06-18',
-      '2025-03-26',
-      '2024-11-05',
-      '2024-10-07',
-    ];
-    const protocolVersion =
-      typeof clientProto === 'string' && supported.includes(clientProto)
-        ? clientProto
-        : '2025-06-18';
-    const logoUrl = `${base}/logo.png`;
-    // eslint-disable-next-line no-console
-    console.error(
-      `[mcp] initialize id=${body.id} clientProto=${clientProto || '(missing)'} → reply proto=${protocolVersion}`,
-    );
-    res.status(200).json({
-      jsonrpc: '2.0',
-      id: body.id,
-      result: {
-        protocolVersion,
-        capabilities: { tools: {} },
-        serverInfo: {
-          name: 'streamline-mcp',
-          title: 'Streamline Vendor',
-          version: '0.4.0',
-          icons: [
-            {
-              src: logoUrl,
-              mimeType: 'image/png',
-              sizes: ['512x512'],
-            },
-          ],
-          websiteUrl: 'https://streamline.com.sa',
-          description:
-            'Manage your Streamline vendor account: bookings, services, employees, reports.',
-        },
-      },
-    });
-    return;
-  }
-
   // Build a fresh Server + tool set scoped to this vendor.
+  //
+  // RESPONSE SHAPE — DELIBERATELY MINIMAL.
+  //
+  // The MCP `Implementation` schema in @modelcontextprotocol/sdk@1.29.0
+  // allows {name, title?, version, icons?, websiteUrl?, description?}.
+  // Anything beyond name+version is OPTIONAL, and we now believe one
+  // of those optional fields is what claude.ai's connector setup
+  // chokes on during the "validate first /mcp response" step that
+  // happens right after the OAuth token is issued — the symptom is
+  // that the OAuth dance completes cleanly (the live logs prove it),
+  // but Claude never makes the follow-up /mcp call and reports
+  // `Authorization with the MCP server failed`.
+  //
+  // History of attempts on this:
+  //   1. `icon: <url>` (singular, not in spec) — failed.
+  //   2. `icons: [{src,mimeType,sizes}]` (spec form) — still failed.
+  //   3. Drop ALL optional branding fields ← we are HERE.
+  //
+  // Claude.ai surfaces the connector's icon by hitting `/logo.png`
+  // and the standard favicon paths directly (Google favicon service)
+  // — so we don't need to declare it in `serverInfo` at all to get
+  // a logo in the UI. The static handler at the top of this file
+  // serves `/logo.png` + the multi-resolution favicons; that's the
+  // discovery path Claude actually uses.
+  //
+  // We also DROP the manual initialize short-circuit and let the
+  // SDK build the response in its own (always-valid) format. Less
+  // surface area for a typo to invalidate the handshake.
   const api = new VendorClient({ token: vendor_token });
   const tools = buildTools(api);
   const toolsByName = new Map(tools.map((t) => [t.name, t]));
 
-  // initialize is short-circuited above; this Server only handles
-  // tools/list and tools/call. Keep its Implementation minimal so
-  // the SDK doesn't accidentally emit competing branding fields.
   const server = new Server(
-    {
-      name: 'streamline-mcp',
-      version: '0.4.0',
-      title: 'Streamline Vendor',
-      description:
-        'Manage your Streamline vendor account: bookings, services, employees, reports.',
-      websiteUrl: 'https://streamline.com.sa',
-    },
+    { name: 'streamline-mcp', version: '0.4.0' },
     { capabilities: { tools: {} } },
   );
 
