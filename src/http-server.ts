@@ -199,11 +199,33 @@ function bearerAuth(req: Request, res: Response, next: NextFunction): void {
   const header = req.headers.authorization || '';
   const match = /^Bearer\s+(.+)$/i.exec(header);
   const base = publicBaseUrl(req);
-  // RFC 9728 says clients discover the OAuth metadata via the
-  // `resource_metadata` parameter on the WWW-Authenticate header.
-  // We point at the path that mirrors the protected resource URL
-  // (which is /mcp) so any spec-aware client lands on the right doc.
-  const wwwAuth = `Bearer realm="streamline-mcp", resource_metadata="${base}/.well-known/oauth-protected-resource/mcp"`;
+  // RFC 9728 + Anthropic's connector spec require that the
+  // `resource_metadata` URL path mirrors the protected resource URL's
+  // path component, AND the `resource` field inside the metadata MUST
+  // match what the user types into Claude as the connector URL.
+  //
+  // Users add this server as `https://mcp.streamline.com.sa` (no path
+  // component). That makes the canonical resource URL the BASE URL,
+  // and per the spec the metadata MUST live at
+  // `/.well-known/oauth-protected-resource` — NOT at
+  // `/.well-known/oauth-protected-resource/mcp`.
+  //
+  // The previous /mcp-suffixed value here told claude.ai "the resource
+  // URL is https://mcp.streamline.com.sa/mcp", which didn't match the
+  // `resource: <base>` value the metadata itself was returning AND
+  // didn't match what the user typed in. claude.ai's connector
+  // implementation reads BOTH signals and bails silently when they
+  // disagree — that's the post-OAuth "Authorization with the MCP
+  // server failed" symptom we've been chasing.
+  //
+  // See: https://claude.com/docs/connectors/building/authentication
+  // > Always return a 401 with a WWW-Authenticate header whose
+  // > resource_metadata parameter points at your protected resource
+  // > metadata document. […] The protected resource metadata
+  // > document's `resource` field must match your MCP server URL
+  // > exactly as the user enters it in Claude, including any path
+  // > component.
+  const wwwAuth = `Bearer realm="streamline-mcp", resource_metadata="${base}/.well-known/oauth-protected-resource"`;
   if (!match) {
     // eslint-disable-next-line no-console
     console.error(

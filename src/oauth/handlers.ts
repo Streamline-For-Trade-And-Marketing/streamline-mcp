@@ -136,7 +136,7 @@ export function makeOauthHandlers(store: OauthStore) {
 
       // eslint-disable-next-line no-console
       console.error(
-        `[oauth/authorize:GET] client_id=${client_id} redirect_uri=${redirect_uri} response_type=${response_type} scope="${scope || ''}" challenge_method=${code_challenge_method || '(none)'}`,
+        `[oauth/authorize:GET] client_id=${client_id} redirect_uri=${redirect_uri} response_type=${response_type} scope="${scope || ''}" challenge_method=${code_challenge_method || '(none)'} ALL_QUERY=${JSON.stringify(req.query)}`,
       );
 
       if (response_type !== 'code') {
@@ -296,9 +296,22 @@ export function makeOauthHandlers(store: OauthStore) {
       };
 
       const { grant_type } = req.body || {};
+      // Log every key in the request body (redact code/verifier/secrets to
+      // ~12 chars). Needed to spot the RFC 8707 `resource` parameter
+      // claude.ai sends — we previously didn't read or log it, and the
+      // current best theory for "post-OAuth silent failure" is that
+      // claude rejects the connection when the resource binding isn't
+      // acknowledged in our metadata or token issuance.
+      const bodyKeys: Record<string, string> = {};
+      for (const [k, v] of Object.entries(req.body || {})) {
+        const s = String(v ?? '');
+        bodyKeys[k] = ['code', 'code_verifier', 'refresh_token', 'client_secret'].includes(k)
+          ? s.slice(0, 12) + '…'
+          : s;
+      }
       // eslint-disable-next-line no-console
       console.error(
-        `[oauth/token] incoming grant_type=${grant_type} content-type=${req.headers['content-type']}`,
+        `[oauth/token] incoming grant_type=${grant_type} content-type=${req.headers['content-type']} body=${JSON.stringify(bodyKeys)}`,
       );
 
       if (grant_type === 'authorization_code') {
