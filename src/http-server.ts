@@ -439,6 +439,17 @@ interface SseSession {
 }
 const sseSessions = new Map<string, SseSession>();
 
+// POST /sse — also bind to mcpHandler. claude.ai's connector probes
+// the configured URL with POST (not GET) on initial discovery, and
+// when /sse only had a GET handler, the POST got Express's default
+// HTML 404 page, NOT a 401 with WWW-Authenticate — confirmed by raw
+// curl comparison against Higgsfield's known-working MCP server,
+// where POST /mcp returns the spec-compliant 401 just like GET /mcp.
+// We mirror that here so claude.ai sees the same shape on EVERY
+// HTTP method against EVERY MCP path we expose (/, /mcp, /sse).
+app.post('/sse', bearerAuth, mcpHandler);
+app.delete('/sse', bearerAuth, mcpHandler);
+
 app.get('/sse', bearerAuth, async (req: Request, res: Response) => {
   const vendor_token = (req as any).vendor_token as string;
   // eslint-disable-next-line no-console
