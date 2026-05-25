@@ -31,6 +31,7 @@ import express, { type Request, type Response, type NextFunction } from 'express
 import { randomUUID } from 'node:crypto';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -177,12 +178,20 @@ app.get('/health', (_req, res) => {
 // serve both shapes so Claude (and any other MCP client) can discover
 // us no matter which path they try first.
 
-const protectedResourceHandler = (req: Request, res: Response) => {
-  res.json(protectedResourceMetadata(req));
+// Each metadata URL path corresponds to a different resource URL,
+// per RFC 9728 §3.1. The path suffix on the well-known URL maps
+// directly to the path component of the protected resource URL.
+// So GET /.well-known/oauth-protected-resource/sse must declare
+// `resource: <base>/sse`, /mcp the /mcp form, and the unsuffixed
+// path the bare-base form.
+const protectedResourceHandler = (resourcePath: string) => (req: Request, res: Response) => {
+  res.json(protectedResourceMetadata(req, resourcePath));
 };
-app.get('/.well-known/oauth-protected-resource', protectedResourceHandler);
-app.get('/.well-known/oauth-protected-resource/mcp', protectedResourceHandler);
-app.get('/mcp/.well-known/oauth-protected-resource', protectedResourceHandler);
+app.get('/.well-known/oauth-protected-resource', protectedResourceHandler('/'));
+app.get('/.well-known/oauth-protected-resource/mcp', protectedResourceHandler('/mcp'));
+app.get('/.well-known/oauth-protected-resource/sse', protectedResourceHandler('/sse'));
+app.get('/mcp/.well-known/oauth-protected-resource', protectedResourceHandler('/mcp'));
+app.get('/sse/.well-known/oauth-protected-resource', protectedResourceHandler('/sse'));
 
 app.get('/.well-known/oauth-authorization-server', (req, res) => {
   res.json(authorizationServerMetadata(req));
@@ -204,19 +213,15 @@ function bearerAuth(req: Request, res: Response, next: NextFunction): void {
   // path component, AND the `resource` field inside the metadata MUST
   // match what the user types into Claude as the connector URL.
   //
-  // Users add this server as `https://mcp.streamline.com.sa` (no path
-  // component). That makes the canonical resource URL the BASE URL,
-  // and per the spec the metadata MUST live at
-  // `/.well-known/oauth-protected-resource` — NOT at
-  // `/.well-known/oauth-protected-resource/mcp`.
+  // The MCP endpoint can be reached at THREE paths in this server:
+  //   /        — Streamable HTTP transport at the root
+  //   /mcp     — Streamable HTTP transport (same handler)
+  //   /sse     — legacy SSE transport (workaround for claude.ai bug)
   //
-  // The previous /mcp-suffixed value here told claude.ai "the resource
-  // URL is https://mcp.streamline.com.sa/mcp", which didn't match the
-  // `resource: <base>` value the metadata itself was returning AND
-  // didn't match what the user typed in. claude.ai's connector
-  // implementation reads BOTH signals and bails silently when they
-  // disagree — that's the post-OAuth "Authorization with the MCP
-  // server failed" symptom we've been chasing.
+  // For each one, the metadata URL path MUST mirror the path of the
+  // resource being protected, otherwise claude.ai bails silently
+  // after OAuth completes — that's the long-standing post-OAuth
+  // failure pattern documented in anthropics/claude-ai-mcp#291 et al.
   //
   // See: https://claude.com/docs/connectors/building/authentication
   // > Always return a 401 with a WWW-Authenticate header whose
@@ -225,7 +230,10 @@ function bearerAuth(req: Request, res: Response, next: NextFunction): void {
   // > document's `resource` field must match your MCP server URL
   // > exactly as the user enters it in Claude, including any path
   // > component.
-  const wwwAuth = `Bearer realm="streamline-mcp", resource_metadata="${base}/.well-known/oauth-protected-resource"`;
+  let suffix = '';
+  if (req.path === '/sse' || req.path.startsWith('/sse/')) suffix = '/sse';
+  else if (req.path === '/mcp' || req.path.startsWith('/mcp/')) suffix = '/mcp';
+  const wwwAuth = `Bearer realm="streamline-mcp", resource_metadata="${base}/.well-known/oauth-protected-resource${suffix}"`;
   if (!match) {
     // eslint-disable-next-line no-console
     console.error(
@@ -392,6 +400,144 @@ app.delete('/', bearerAuth, mcpHandler);
 app.post('/mcp', bearerAuth, mcpHandler);
 app.get('/mcp', bearerAuth, mcpHandler);
 app.delete('/mcp', bearerAuth, mcpHandler);
+
+// ── /sse legacy transport (claude.ai connector workaround) ──────
+//
+// claude.ai's custom-connector implementation has a long-standing,
+// "Closed: not planned" bug that breaks the post-OAuth handshake on
+// /mcp (Streamable HTTP) endpoints — the OAuth dance completes
+// cleanly (logs prove it), but Claude.ai then silently fails to send
+// the follow-up POST initialize, and the user gets
+//   "Authorization with the MCP server failed (ofid_…)"
+// every time.
+//
+// The documented workaround is to expose the LEGACY SSE transport
+// (separate code path inside claude.ai's connector that doesn't share
+// the broken validation step) at /sse. See:
+//   • https://github.com/anthropics/claude-ai-mcp/issues/291
+//   • https://github.com/anthropics/claude-ai-mcp/issues/155
+//
+// The SSE transport is stateful: the GET /sse request opens a
+// long-lived event-stream, the server pushes JSON-RPC responses down
+// it, and the client sends incoming messages via POST /messages?
+// sessionId=<id>. We keep a session map keyed by sessionId →
+// {transport, vendor_token}. Sessions are torn down on close.
+//
+// The bearer-token check still runs on BOTH endpoints — Claude must
+// be authenticated to either open the SSE stream OR post a message.
+
+interface SseSession {
+  transport: SSEServerTransport;
+  vendor_token: string;
+}
+const sseSessions = new Map<string, SseSession>();
+
+app.get('/sse', bearerAuth, async (req: Request, res: Response) => {
+  const vendor_token = (req as any).vendor_token as string;
+  // eslint-disable-next-line no-console
+  console.error(`[sse] GET /sse opening stream (vendor_token len=${vendor_token.length})`);
+
+  // The endpoint path claude.ai posts back to. Must be served by us.
+  const transport = new SSEServerTransport('/messages', res);
+  const sessionId = transport.sessionId;
+  sseSessions.set(sessionId, { transport, vendor_token });
+
+  // eslint-disable-next-line no-console
+  console.error(`[sse] sessionId=${sessionId} (active sessions=${sseSessions.size})`);
+
+  // Spin up a fresh per-vendor Server + tool set, connected via the
+  // SSE transport. Same wiring as the /mcp path; only the transport
+  // differs.
+  const api = new VendorClient({ token: vendor_token });
+  const tools = buildTools(api);
+  const toolsByName = new Map(tools.map((t) => [t.name, t]));
+
+  const server = new Server(
+    { name: 'streamline-mcp', version: '0.4.0' },
+    { capabilities: { tools: {} } },
+  );
+
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: tools.map((t) => ({
+      name: t.name,
+      description: t.description,
+      inputSchema: zodToJsonSchema(t.inputSchema),
+    })),
+  }));
+
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params;
+    const tool = toolsByName.get(name);
+    if (!tool) {
+      return { isError: true, content: [{ type: 'text', text: `Unknown tool: ${name}` }] };
+    }
+    const parsed = tool.inputSchema.safeParse(args ?? {});
+    if (!parsed.success) {
+      return {
+        isError: true,
+        content: [
+          { type: 'text', text: `Invalid arguments for ${name}: ${parsed.error.message}` },
+        ],
+      };
+    }
+    try {
+      const result = await tool.handler(parsed.data);
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    } catch (err: any) {
+      return {
+        isError: true,
+        content: [{ type: 'text', text: `Error calling ${name}: ${err?.message ?? err}` }],
+      };
+    }
+  });
+
+  // Clean up when the client disconnects (browser navigates away,
+  // network drops, or claude.ai tears the connection). Without this
+  // we'd accumulate dead sessions in memory.
+  res.on('close', () => {
+    // eslint-disable-next-line no-console
+    console.error(`[sse] sessionId=${sessionId} closed (active sessions=${sseSessions.size - 1})`);
+    sseSessions.delete(sessionId);
+    transport.close().catch(() => {});
+    server.close().catch(() => {});
+  });
+
+  try {
+    await server.connect(transport);
+  } catch (err: any) {
+    // eslint-disable-next-line no-console
+    console.error(`[sse] connect error: ${err?.message ?? err}`);
+    sseSessions.delete(sessionId);
+    if (!res.headersSent) res.status(500).end();
+  }
+});
+
+// POST /messages?sessionId=<id> — the client's outbound channel in
+// the SSE transport. NO bearerAuth on this one because the sessionId
+// itself is the authorization (it's an opaque UUID we minted and
+// handed to the authenticated client over the SSE stream). Anyone
+// without the sessionId can't post messages.
+app.post('/messages', async (req: Request, res: Response) => {
+  const sessionId = (req.query.sessionId as string) || '';
+  const session = sseSessions.get(sessionId);
+  if (!session) {
+    // eslint-disable-next-line no-console
+    console.error(`[sse] POST /messages 404 unknown sessionId="${sessionId}"`);
+    res.status(404).json({ error: 'unknown_session' });
+    return;
+  }
+  // eslint-disable-next-line no-console
+  console.error(
+    `[sse] POST /messages sessionId=${sessionId} method=${(req.body as any)?.method ?? '(none)'}`,
+  );
+  try {
+    await session.transport.handlePostMessage(req, res, req.body);
+  } catch (err: any) {
+    // eslint-disable-next-line no-console
+    console.error(`[sse] handlePostMessage error: ${err?.message ?? err}`);
+    if (!res.headersSent) res.status(500).json({ error: String(err) });
+  }
+});
 
 // ── Periodic OAuth-store cleanup ────────────────────────────────
 

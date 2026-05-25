@@ -80,32 +80,31 @@ function branding(base: string): Record<string, unknown> {
   };
 }
 
-export function protectedResourceMetadata(req: Request): Record<string, unknown> {
+/**
+ * Build the protected-resource metadata document for one of three
+ * possible MCP endpoint paths in this server:
+ *
+ *   resourcePath = "/"    → resource: "https://host/"     (root, Streamable HTTP)
+ *   resourcePath = "/mcp" → resource: "https://host/mcp"  (Streamable HTTP at /mcp)
+ *   resourcePath = "/sse" → resource: "https://host/sse"  (legacy SSE — workaround for claude.ai /mcp+OAuth bug)
+ *
+ * Per RFC 9728 §3.1 + Anthropic's connector spec, the `resource`
+ * field MUST match the user-entered connector URL byte-for-byte
+ * (canonicalized via the browser URL parser). Host-only URLs gain
+ * an implicit "/" path component, so the root form keeps the
+ * trailing slash; URLs with explicit paths do NOT get a slash
+ * appended.
+ */
+export function protectedResourceMetadata(
+  req: Request,
+  resourcePath: string = '/',
+): Record<string, unknown> {
   const base = publicBaseUrl(req);
-  // RFC 8707 + WHATWG URL canonicalization: a host-only URL like
-  // `https://mcp.streamline.com.sa` normalizes to
-  // `https://mcp.streamline.com.sa/` (implicit root path = "/").
-  //
-  // The live logs confirm claude.ai ALWAYS sends the trailing-slash
-  // form on /oauth/authorize and /oauth/token:
-  //
-  //   resource=https://mcp.streamline.com.sa/
-  //
-  // …because claude.ai runs the user-typed URL through the browser's
-  // URL parser to canonicalize before signing the resource parameter.
-  // RFC 8707 §2: the resource parameter MUST be passed byte-for-byte
-  // to the audience check.
-  //
-  // We previously declared `resource: <base>` (no slash) — those two
-  // values then disagreed for resource-validation purposes, and
-  // claude.ai's connector quietly drops the connection rather than
-  // emitting a token-bound to the wrong audience. That was the
-  // post-OAuth silent-failure symptom we've been chasing.
-  //
-  // FIX: declare the resource with the same trailing slash claude.ai
-  // sends. The authorization_servers entry stays slash-less because
-  // that's the OAuth 2.0 issuer convention.
-  const resource = `${base}/`;
+  // Build `resource`:
+  //   "/"    → "https://host/"
+  //   "/mcp" → "https://host/mcp"   (no trailing slash — explicit path)
+  //   "/sse" → "https://host/sse"   (same)
+  const resource = resourcePath === '/' ? `${base}/` : `${base}${resourcePath}`;
   return {
     resource,
     authorization_servers: [base],
