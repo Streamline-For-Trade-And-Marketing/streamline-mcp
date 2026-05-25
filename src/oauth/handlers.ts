@@ -88,6 +88,10 @@ export function makeOauthHandlers(store: OauthStore) {
         redirect_uris.length === 0 ||
         redirect_uris.some((u) => typeof u !== 'string')
       ) {
+        // eslint-disable-next-line no-console
+        console.error(
+          `[oauth/register] 400 invalid_redirect_uri name="${client_name}" redirects=${JSON.stringify(redirect_uris)}`,
+        );
         res
           .status(400)
           .json({ error: 'invalid_redirect_uri', error_description: 'redirect_uris[] required' });
@@ -96,6 +100,10 @@ export function makeOauthHandlers(store: OauthStore) {
       const client = store.registerClient(
         typeof client_name === 'string' ? client_name : 'Unknown MCP client',
         redirect_uris,
+      );
+      // eslint-disable-next-line no-console
+      console.error(
+        `[oauth/register] 201 client_id=${client.client_id} name="${client.client_name}" redirects=${JSON.stringify(client.redirect_uris)}`,
       );
       // RFC 7591 §3.2.1 — return the client info.
       res.status(201).json({
@@ -126,20 +134,35 @@ export function makeOauthHandlers(store: OauthStore) {
         code_challenge_method,
       } = req.query as Record<string, string | undefined>;
 
+      // eslint-disable-next-line no-console
+      console.error(
+        `[oauth/authorize:GET] client_id=${client_id} redirect_uri=${redirect_uri} response_type=${response_type} scope="${scope || ''}" challenge_method=${code_challenge_method || '(none)'}`,
+      );
+
       if (response_type !== 'code') {
+        // eslint-disable-next-line no-console
+        console.error(`[oauth/authorize:GET] 400 unsupported response_type=${response_type}`);
         res.status(400).type('html').send(errorPage('Only response_type=code is supported.'));
         return;
       }
       if (!client_id) {
+        // eslint-disable-next-line no-console
+        console.error(`[oauth/authorize:GET] 400 missing client_id`);
         res.status(400).type('html').send(errorPage('Missing client_id.'));
         return;
       }
       const client = store.getClient(client_id);
       if (!client) {
+        // eslint-disable-next-line no-console
+        console.error(`[oauth/authorize:GET] 400 unknown client_id=${client_id}`);
         res.status(400).type('html').send(errorPage('Unknown client.'));
         return;
       }
       if (!redirect_uri || !client.redirect_uris.includes(redirect_uri)) {
+        // eslint-disable-next-line no-console
+        console.error(
+          `[oauth/authorize:GET] 400 redirect_uri="${redirect_uri}" not in registered ${JSON.stringify(client.redirect_uris)}`,
+        );
         res
           .status(400)
           .type('html')
@@ -149,6 +172,10 @@ export function makeOauthHandlers(store: OauthStore) {
       // PKCE — Claude always sends S256. We accept "plain" too for
       // dev-time curl testing but log a warning if it ever happens.
       if (code_challenge && !['S256', 'plain'].includes(code_challenge_method || 'plain')) {
+        // eslint-disable-next-line no-console
+        console.error(
+          `[oauth/authorize:GET] 400 unsupported challenge_method=${code_challenge_method}`,
+        );
         res.status(400).type('html').send(errorPage('Unsupported code_challenge_method.'));
         return;
       }
@@ -182,6 +209,10 @@ export function makeOauthHandlers(store: OauthStore) {
       const { request_id, username, password } = req.body || {};
       const session = typeof request_id === 'string' ? pending.get(request_id) : null;
       if (!session) {
+        // eslint-disable-next-line no-console
+        console.error(
+          `[oauth/authorize:POST] 400 missing/expired session request_id=${request_id}`,
+        );
         res
           .status(400)
           .type('html')
@@ -206,6 +237,11 @@ export function makeOauthHandlers(store: OauthStore) {
         });
         pending.delete(request_id);
 
+        // eslint-disable-next-line no-console
+        console.error(
+          `[oauth/authorize:POST] 302 issued code for client=${session.client_id} user="${result.user.email}" type=${result.user.type} → ${session.redirect_uri}`,
+        );
+
         // Redirect back to the OAuth client with the code + state.
         const url = new URL(session.redirect_uri);
         url.searchParams.set('code', code);
@@ -216,6 +252,10 @@ export function makeOauthHandlers(store: OauthStore) {
           err instanceof StreamlineAuthError
             ? err.message
             : 'تعذّر الاتصال بـ Streamline. حاول مرة ثانية بعد قليل.';
+        // eslint-disable-next-line no-console
+        console.error(
+          `[oauth/authorize:POST] ${err instanceof StreamlineAuthError ? err.status : 502} login failed for "${username}" — ${errMsg}`,
+        );
         const client = store.getClient(session.client_id);
         res
           .status(err instanceof StreamlineAuthError ? err.status : 502)

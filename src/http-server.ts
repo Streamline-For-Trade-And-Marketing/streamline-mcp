@@ -58,6 +58,26 @@ app.set('trust proxy', 1);
 app.use(express.json({ limit: '4mb' }));
 app.use(express.urlencoded({ extended: true }));
 
+// ── Request log middleware ──────────────────────────────────────
+//
+// Logs every single HTTP request the moment it arrives, BEFORE any
+// other middleware can short-circuit it. Specifically aimed at
+// debugging claude.ai connector failures where we previously couldn't
+// tell whether a request even reached the server (auth failures inside
+// /mcp don't log on the success-only [mcp] path, and Cloudflare 4xx's
+// before the request would invisibly drop too). Every line is prefixed
+// with [req] so it's grep-able in the Coolify logs panel.
+app.use((req, _res, next) => {
+  const auth = req.headers.authorization
+    ? `auth=${(req.headers.authorization as string).slice(0, 14)}…`
+    : 'auth=(none)';
+  // eslint-disable-next-line no-console
+  console.error(
+    `[req] ${req.method} ${req.path} ua="${(req.headers['user-agent'] || '').slice(0, 60)}" ${auth} ct=${req.headers['content-type'] || '-'}`,
+  );
+  next();
+});
+
 // Static assets — logo + favicon. Cached aggressively (immutable
 // for a year) since the filename never changes inside a deploy and
 // a redeploy bumps the docker image hash anyway. Mounted BEFORE the
@@ -185,20 +205,33 @@ function bearerAuth(req: Request, res: Response, next: NextFunction): void {
   // (which is /mcp) so any spec-aware client lands on the right doc.
   const wwwAuth = `Bearer realm="streamline-mcp", resource_metadata="${base}/.well-known/oauth-protected-resource/mcp"`;
   if (!match) {
+    // eslint-disable-next-line no-console
+    console.error(
+      `[bearerAuth] 401 missing bearer on ${req.method} ${req.path} (raw header="${header.slice(0, 30)}")`,
+    );
     res
       .status(401)
       .header('WWW-Authenticate', wwwAuth)
       .json({ error: 'invalid_token', error_description: 'Missing Bearer token.' });
     return;
   }
+  const tokenPrefix = match[1].slice(0, 16);
   const record = store.getAccessToken(match[1]);
   if (!record) {
+    // eslint-disable-next-line no-console
+    console.error(
+      `[bearerAuth] 401 unknown/expired token "${tokenPrefix}…" on ${req.method} ${req.path}`,
+    );
     res
       .status(401)
       .header('WWW-Authenticate', `${wwwAuth}, error="invalid_token"`)
       .json({ error: 'invalid_token', error_description: 'Token expired or unknown.' });
     return;
   }
+  // eslint-disable-next-line no-console
+  console.error(
+    `[bearerAuth] 200 token "${tokenPrefix}…" ok (client=${record.client_id}) on ${req.method} ${req.path}`,
+  );
   // Attach the vendor token onto the request so the MCP handlers below
   // can construct a per-request VendorClient.
   (req as any).vendor_token = record.vendor_token;
@@ -228,25 +261,56 @@ async function mcpHandler(req: Request, res: Response): Promise<void> {
 
   const base = publicBaseUrl(req);
 
-  // Short-circuit `initialize` so we can add the singular `icon`
-  // field that some claude.ai clients have been observed reading,
-  // alongside the SEP-973 `icons[]` array. The SDK's Zod schema
-  // strips unknown fields like `icon`, so the only way to ship it
-  // is to write the response ourselves.
+  // Short-circuit `initialize` so we can ship the SEP-973 `icons[]`
+  // array (which the MCP SDK's strict Zod schema would otherwise
+  // strip in the default Server.connect() pipeline). Use the schema
+  // shape per @modelcontextprotocol/sdk@1.29.0:
   //
-  // Rules of engagement (learned the hard way last time):
-  //   1. Match the SDK's response shape EXACTLY — same fields, same
-  //      types, same order. Add only ONE thing on top: `icon`.
-  //   2. Keep the response small (<1KB). 32KB base64 payloads broke
-  //      claude.ai's auth handshake.
-  //   3. NO non-standard kitchen-sink fields (iconUrl, logoUrl,
-  //      _meta, displayName, …). They get the response rejected.
-  //   4. `sizes` is an ARRAY of strings per the Icon schema. A
-  //      single string ("512x512") triggers Zod validation errors.
+  //   ImplementationSchema = {
+  //     name, title?, version,
+  //     icons?: [{ src, mimeType?, sizes?: string[] }],
+  //     websiteUrl?, description?
+  //   }
+  //
+  // PREVIOUS BUG: we shipped a singular `icon: <url>` field as a
+  // workaround for an old claude.ai behaviour. That field is NOT in
+  // the SDK schema. Some claude.ai builds run strict schema validation
+  // on the initialize response — and we suspect that's what's been
+  // failing with `Authorization with the MCP server failed`: the
+  // OAuth dance completes (logs confirm), then Claude rejects the
+  // first /mcp response and bails before a second call. Switched
+  // to the spec-defined `icons[]` array exclusively. If we ever need
+  // both, add `icon` alongside — never instead of.
+  //
+  // Rules of engagement:
+  //   1. Match the SDK's response shape EXACTLY.
+  //   2. Keep the response small (<1KB) — claude.ai rejected a 32KB
+  //      base64 payload with a JSON-Schema validation error.
+  //   3. `sizes` is an ARRAY of strings ("512x512"), never a single
+  //      string — that triggers Zod validation errors.
   const body = req.body as any;
   if (body?.method === 'initialize' && typeof body?.id !== 'undefined') {
-    const protocolVersion = body?.params?.protocolVersion || '2025-11-25';
+    const clientProto = body?.params?.protocolVersion;
+    // SUPPORTED_PROTOCOL_VERSIONS in @modelcontextprotocol/sdk@1.29.0
+    // = ['2025-11-25','2025-06-18','2025-03-26','2024-11-05','2024-10-07'].
+    // Echo the client's version when supported; otherwise reply with
+    // the latest WE know so the client can decide to disconnect.
+    const supported = [
+      '2025-11-25',
+      '2025-06-18',
+      '2025-03-26',
+      '2024-11-05',
+      '2024-10-07',
+    ];
+    const protocolVersion =
+      typeof clientProto === 'string' && supported.includes(clientProto)
+        ? clientProto
+        : '2025-06-18';
     const logoUrl = `${base}/logo.png`;
+    // eslint-disable-next-line no-console
+    console.error(
+      `[mcp] initialize id=${body.id} clientProto=${clientProto || '(missing)'} → reply proto=${protocolVersion}`,
+    );
     res.status(200).json({
       jsonrpc: '2.0',
       id: body.id,
@@ -255,17 +319,18 @@ async function mcpHandler(req: Request, res: Response): Promise<void> {
         capabilities: { tools: {} },
         serverInfo: {
           name: 'streamline-mcp',
-          version: '0.4.0',
           title: 'Streamline Vendor',
+          version: '0.4.0',
+          icons: [
+            {
+              src: logoUrl,
+              mimeType: 'image/png',
+              sizes: ['512x512'],
+            },
+          ],
+          websiteUrl: 'https://streamline.com.sa',
           description:
             'Manage your Streamline vendor account: bookings, services, employees, reports.',
-          websiteUrl: 'https://streamline.com.sa',
-          // Singular `icon` field — the workaround people on
-          // github.com/anthropics/claude-ai-mcp#152 keep reporting
-          // "sometimes" makes the icon show in claude.ai's connector
-          // list. We removed the SEP-973 `icons[]` array on user
-          // request to test whether the singular form alone works.
-          icon: logoUrl,
         },
       },
     });
