@@ -233,7 +233,14 @@ function bearerAuth(req: Request, res: Response, next: NextFunction): void {
   let suffix = '';
   if (req.path === '/sse' || req.path.startsWith('/sse/')) suffix = '/sse';
   else if (req.path === '/mcp' || req.path.startsWith('/mcp/')) suffix = '/mcp';
-  const wwwAuth = `Bearer realm="streamline-mcp", resource_metadata="${base}/.well-known/oauth-protected-resource${suffix}"`;
+  // WWW-Authenticate header form MATCHED to Higgsfield's known-working
+  // claude.ai connector. Specifically:
+  //   • drop the `realm=` parameter — claude.ai parses Bearer challenges
+  //     and the realm token apparently confuses its tokenizer
+  //   • include `scope=` so claude.ai sees the SAME scope list
+  //     declared in the protected-resource metadata body, in the
+  //     space-separated form RFC 6750 §3 wants on the header
+  const wwwAuth = `Bearer resource_metadata="${base}/.well-known/oauth-protected-resource${suffix}", scope="openid email offline_access"`;
   if (!match) {
     // eslint-disable-next-line no-console
     console.error(

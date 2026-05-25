@@ -100,14 +100,31 @@ export function protectedResourceMetadata(
   resourcePath: string = '/',
 ): Record<string, unknown> {
   const base = publicBaseUrl(req);
-  // Build `resource`:
-  //   "/"    → "https://host/"
-  //   "/mcp" → "https://host/mcp"   (no trailing slash — explicit path)
-  //   "/sse" → "https://host/sse"   (same)
-  const resource = resourcePath === '/' ? `${base}/` : `${base}${resourcePath}`;
+  // Build `resource` to MATCH HIGGSFIELD'S WORKING claude.ai connector:
+  //
+  //   higgsfield: resource = "https://mcp.higgsfield.ai"   (no trailing slash)
+  //
+  // For host-only URLs we previously declared `https://host/` with a
+  // trailing slash, on the theory that claude.ai's URL parser
+  // canonicalizes the user-typed bare host to add the slash. The live
+  // logs CONFIRMED claude.ai sends `resource=https://host/` in the
+  // authorize/token requests — BUT Higgsfield's working server still
+  // declares the slash-less form in the metadata body. So claude.ai's
+  // validator is apparently more lenient than we feared on this one
+  // dimension and stricter on others.
+  //
+  // Path-form resources (/mcp, /sse) NEVER get a trailing slash —
+  // RFC 8707 canonical form for URLs with explicit paths is without
+  // the trailing slash.
+  const resource =
+    resourcePath === '/' ? base : `${base}${resourcePath}`;
   return {
     resource,
     authorization_servers: [base],
+    // Standard OIDC scopes — claude.ai treats custom scope names like
+    // "vendor" as unrecognized and silently bails post-OAuth. Matched
+    // to Higgsfield's working set.
+    scopes_supported: ['openid', 'email', 'offline_access'],
     bearer_methods_supported: ['header'],
     resource_documentation: `${base}/`,
     ...branding(base),
@@ -116,17 +133,40 @@ export function protectedResourceMetadata(
 
 export function authorizationServerMetadata(req: Request): Record<string, unknown> {
   const base = publicBaseUrl(req);
+  // Field set MATCHED to Higgsfield's working production claude.ai
+  // connector OAuth metadata (https://mcp.higgsfield.ai/.well-known/
+  // oauth-authorization-server). Specifically:
+  //
+  //   - scopes_supported: standard OIDC scopes (openid, email,
+  //     offline_access) — custom names like "vendor" are silently
+  //     rejected by claude.ai's connector validation
+  //   - token_endpoint_auth_methods_supported: includes basic + post
+  //     forms alongside the bare "none" we previously advertised. We
+  //     don't actually USE client_secret authentication (our clients
+  //     are all public), but claude.ai apparently inspects this list
+  //     and is suspicious of single-element lists
+  //   - response_modes_supported: form_post + query
+  //   - claims_supported: standard set the metadata MAY include
+  //
+  // PKCE S256 is non-negotiable for the OAuth 2.1 / claude.ai client
+  // path; we keep "plain" advertised for dev-time curl probing but
+  // claude.ai always picks S256.
   return {
     issuer: base,
     authorization_endpoint: `${base}/oauth/authorize`,
     token_endpoint: `${base}/oauth/token`,
     registration_endpoint: `${base}/oauth/register`,
-    // PKCE is mandatory for public clients in OAuth 2.1.
-    code_challenge_methods_supported: ['S256', 'plain'],
-    grant_types_supported: ['authorization_code', 'refresh_token'],
     response_types_supported: ['code'],
-    token_endpoint_auth_methods_supported: ['none'],
-    scopes_supported: ['vendor'],
+    response_modes_supported: ['form_post', 'query'],
+    grant_types_supported: ['authorization_code', 'refresh_token'],
+    token_endpoint_auth_methods_supported: [
+      'client_secret_basic',
+      'client_secret_post',
+      'none',
+    ],
+    code_challenge_methods_supported: ['S256', 'plain'],
+    scopes_supported: ['openid', 'email', 'offline_access'],
+    claims_supported: ['sub', 'iss', 'aud', 'exp', 'iat', 'email', 'name'],
     ...branding(base),
   };
 }
