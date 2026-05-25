@@ -82,11 +82,32 @@ function branding(base: string): Record<string, unknown> {
 
 export function protectedResourceMetadata(req: Request): Record<string, unknown> {
   const base = publicBaseUrl(req);
-  // Resource is the BASE URL (no /mcp suffix). Claude.ai uses the
-  // configured connector URL as-is for MCP calls, and we serve the
-  // MCP transport at both the root and /mcp to be safe.
+  // RFC 8707 + WHATWG URL canonicalization: a host-only URL like
+  // `https://mcp.streamline.com.sa` normalizes to
+  // `https://mcp.streamline.com.sa/` (implicit root path = "/").
+  //
+  // The live logs confirm claude.ai ALWAYS sends the trailing-slash
+  // form on /oauth/authorize and /oauth/token:
+  //
+  //   resource=https://mcp.streamline.com.sa/
+  //
+  // …because claude.ai runs the user-typed URL through the browser's
+  // URL parser to canonicalize before signing the resource parameter.
+  // RFC 8707 §2: the resource parameter MUST be passed byte-for-byte
+  // to the audience check.
+  //
+  // We previously declared `resource: <base>` (no slash) — those two
+  // values then disagreed for resource-validation purposes, and
+  // claude.ai's connector quietly drops the connection rather than
+  // emitting a token-bound to the wrong audience. That was the
+  // post-OAuth silent-failure symptom we've been chasing.
+  //
+  // FIX: declare the resource with the same trailing slash claude.ai
+  // sends. The authorization_servers entry stays slash-less because
+  // that's the OAuth 2.0 issuer convention.
+  const resource = `${base}/`;
   return {
-    resource: base,
+    resource,
     authorization_servers: [base],
     bearer_methods_supported: ['header'],
     resource_documentation: `${base}/`,
