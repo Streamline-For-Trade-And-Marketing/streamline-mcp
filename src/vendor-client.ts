@@ -22,6 +22,71 @@ const DEFAULT_BASE = 'https://api.streamline.com.sa/vendor/v1';
 const RATE_LIMIT_PER_MIN = 50;
 const WINDOW_MS = 60_000;
 
+/**
+ * Recursively append a value to a FormData under `key`.
+ *
+ * Handles three shapes that Laravel's request bag expects:
+ *
+ *   • scalar → `key=value`
+ *   • flat array of scalars → `key[]=v1`, `key[]=v2`, …
+ *   • array of objects → `key[idx][subkey]=value` for every leaf
+ *   • nested object → `key[subkey]=value`
+ *
+ * Why this matters: the vendor Branch/Employee/Service endpoints
+ * require `official_hours`, `break_hours`, and `home_hours` as an
+ * array of `{day, start_time, end_time}` objects. The old encoder
+ * called `String(item)` on each object, which yielded the literal
+ * "[object Object]" — Laravel rejected the payload with a confusing
+ * "must be an array" message. This recursive walker produces the
+ * canonical PHP-style shape that Laravel parses back into structured
+ * data.
+ *
+ * Null/undefined values are skipped so callers can pass through
+ * sparsely-populated payloads without having to pre-clean them.
+ */
+function appendFormValue(
+  fd: FormData,
+  key: string,
+  value: any,
+  debugFields?: string[],
+): void {
+  if (value === undefined || value === null) return;
+
+  if (Array.isArray(value)) {
+    value.forEach((item, idx) => {
+      if (item === undefined || item === null) return;
+      if (
+        typeof item === 'object' &&
+        !(item instanceof Blob) &&
+        !(typeof File !== 'undefined' && item instanceof File)
+      ) {
+        for (const [ik, iv] of Object.entries(item)) {
+          appendFormValue(fd, `${key}[${idx}][${ik}]`, iv, debugFields);
+        }
+      } else {
+        const flat = `${key}[]`;
+        fd.append(flat, String(item));
+        if (debugFields) debugFields.push(`${flat}=${item}`);
+      }
+    });
+    return;
+  }
+
+  if (
+    typeof value === 'object' &&
+    !(value instanceof Blob) &&
+    !(typeof File !== 'undefined' && value instanceof File)
+  ) {
+    for (const [sk, sv] of Object.entries(value)) {
+      appendFormValue(fd, `${key}[${sk}]`, sv, debugFields);
+    }
+    return;
+  }
+
+  fd.append(key, String(value));
+  if (debugFields) debugFields.push(`${key}=${value}`);
+}
+
 class TokenBucket {
   private timestamps: number[] = [];
   private waiting: Array<() => void> = [];
@@ -116,6 +181,12 @@ export class VendorClient {
    * vendor API accept multipart with `_method=PUT`, but JSON works for
    * the activate/deactivate / cancel-style operations we use in the
    * MCP layer. Pass `{ multipart: true }` to switch to FormData.
+   *
+   * Multipart encoding supports nested arrays-of-objects via the
+   * standard `key[idx][subkey]` shape that Laravel's request bag
+   * parses back into `array<string, mixed>`. This unlocks the
+   * `official_hours`, `break_hours`, and `home_hours` payloads that
+   * the vendor Branch/Employee/Service endpoints require.
    */
   async post<T = any>(
     path: string,
@@ -131,16 +202,7 @@ export class VendorClient {
         const debugFields: string[] = [];
         for (const [k, v] of Object.entries(body)) {
           if (v === undefined || v === null) continue;
-          if (Array.isArray(v)) {
-            v.forEach((item) => {
-              if (item === undefined || item === null) return;
-              fd.append(`${k}[]`, String(item));
-              if (process.env.STREAMLINE_DEBUG) debugFields.push(`${k}[]=${item}`);
-            });
-          } else {
-            fd.append(k, String(v));
-            if (process.env.STREAMLINE_DEBUG) debugFields.push(`${k}=${v}`);
-          }
+          appendFormValue(fd, k, v, debugFields);
         }
         // Opt-in debug — set STREAMLINE_DEBUG=1 in the env to see
         // exactly what the MCP is sending. Kept after the walk-in
@@ -154,6 +216,23 @@ export class VendorClient {
         headers['Content-Type'] = 'multipart/form-data';
       }
       const res = await this.axios.post(path, payload, { headers });
+      return (res.data?.data ?? res.data) as T;
+    } catch (err) {
+      throw this.normaliseError(err);
+    }
+  }
+
+  /**
+   * DELETE helper. Used for soft-delete and hard-delete endpoints on
+   * the vendor API. The MCP intentionally does NOT expose DELETE tools
+   * to Claude — keeping this method here only so future maintenance
+   * (e.g. internal admin scripts that share the same client) can use
+   * it without re-implementing the rate-limit + error normalisation.
+   */
+  async delete<T = any>(path: string): Promise<T> {
+    await this.bucket.take();
+    try {
+      const res = await this.axios.delete(path);
       return (res.data?.data ?? res.data) as T;
     } catch (err) {
       throw this.normaliseError(err);
