@@ -1010,7 +1010,7 @@ export function buildTools(api: VendorClient): ToolDef[] {
     {
       name: 'offer',
       description:
-        'Manage promotional offers.\n\nACTIONS:\n• `list` — list offers. Optional: branch_id, per_page.\n• `get` — one offer by id. Required: id.\n• `create` — new offer. Required: name_ar, description_ar, section_id, service_ids (array), branch_id (array), price_type, service_price. Conditional: discount_percentage (when price_type="discount"), offer_price (when price_type="special").\n• `update` — update one. Required: id. All other fields optional.\n• `activate` / `deactivate` — toggle is_active. Required: id.\n\nPRICE-TYPE SEMANTICS:\n• `service` → offer_price = service_price, discount = 0 (no discount; the offer is just bundling).\n• `free` → offer_price = 0, discount = 100 (100% off).\n• `discount` → caller provides discount_percentage; offer_price auto-computed.\n• `special` → caller provides offer_price; discount_percentage auto-computed.\n\nArabic-only. CONFIRM the pricing math with the vendor before write actions.',
+        'Manage promotional offers.\n\nACTIONS:\n• `list` — list offers. Optional: branch_id, per_page.\n• `get` — one offer by id. Required: id.\n• `create` — new offer. Required: name_ar, description_ar, section_id, service_ids (array), branch_id (array), price_type, service_price. Conditional: discount_percentage (when price_type="discount"), offer_price (when price_type="special"). Optional home-service fields: is_home_service, home_service_fee, home_hours.\n• `update` — update one. Required: id. All other fields optional.\n• `activate` / `deactivate` — toggle is_active. Required: id.\n\nPRICE-TYPE SEMANTICS:\n• `service` → offer_price = service_price, discount = 0 (no discount; the offer is just bundling).\n• `free` → offer_price = 0, discount = 100 (100% off).\n• `discount` → caller provides discount_percentage; offer_price auto-computed.\n• `special` → caller provides offer_price; discount_percentage auto-computed.\n\nHOME-SERVICE (May-2026): offers can be flagged as home-delivery just like services. Pass `is_home_service: true` AND `home_hours: [{day, start_time, end_time}, ...]` to mark the offer as available at the customer\'s home. Optional `home_service_fee` is the surcharge layered on top of the offer\'s price. Toggling is_home_service OFF will WIPE existing home_hours server-side (delete-all-then-insert sync).\n\nArabic-only. CONFIRM the pricing math with the vendor before write actions.',
       inputSchema: z.object({
         action: z.enum([
           'list',
@@ -1032,6 +1032,23 @@ export function buildTools(api: VendorClient): ToolDef[] {
         discount_percentage: z.number().min(0).max(100).optional(),
         offer_price: z.number().nonnegative().optional(),
         sort: z.number().int().min(1).optional(),
+        // May-2026 — home-delivery on offers (commit db0206b).
+        // Same shape as the `service` umbrella's home fields so
+        // vendors and the backend treat the two interchangeably.
+        is_home_service: z.boolean().optional(),
+        home_service_fee: z
+          .number()
+          .nonnegative()
+          .optional()
+          .describe(
+            'Surcharge added on top of the offer price for home-delivery bookings.',
+          ),
+        home_hours: z
+          .array(hourRowSchema)
+          .optional()
+          .describe(
+            'Required when is_home_service=true. Per-weekday windows when the offer can be booked at the customer\'s home.',
+          ),
       }),
       handler: async (input) => {
         const computePricing = (
@@ -1113,6 +1130,17 @@ export function buildTools(api: VendorClient): ToolDef[] {
               offer_price,
             };
             if (input.sort !== undefined) payload.sort = input.sort;
+            // Home-service opt-in. Mirrors the service umbrella —
+            // when the toggle is on, attach the fee + home_hours;
+            // when it's off (or omitted) the backend defaults the
+            // column to 0 and no home_hours rows are inserted.
+            if (input.is_home_service) {
+              payload.is_home_service = '1';
+              if (input.home_service_fee !== undefined)
+                payload.home_service_fee = input.home_service_fee;
+              if (input.home_hours && input.home_hours.length > 0)
+                payload.home_hours = input.home_hours;
+            }
             return api.post('/offers', clean(payload), { multipart: true });
           }
           case 'update': {
@@ -1166,6 +1194,37 @@ export function buildTools(api: VendorClient): ToolDef[] {
               offer_price,
             };
             if (input.sort !== undefined) payload.sort = input.sort;
+            // Home-service round-trip. The Offer model casts
+            // is_home_service to boolean, so `current.is_home_service`
+            // arrives as a real bool — `Boolean(...)` handles both
+            // the cast-to-bool shape and any legacy int 0/1 form.
+            // The backend's syncOfferHomeHours is delete-all-then-
+            // insert: when staying ON we MUST re-send home_hours
+            // (otherwise they get wiped); when flipping OFF we just
+            // send is_home_service=0 and the rows disappear.
+            const homeOn =
+              input.is_home_service !== undefined
+                ? input.is_home_service
+                : Boolean(current.is_home_service);
+            if (homeOn) {
+              payload.is_home_service = '1';
+              if (input.home_service_fee !== undefined)
+                payload.home_service_fee = input.home_service_fee;
+              else if (current.home_service_fee !== undefined)
+                payload.home_service_fee = current.home_service_fee;
+              const hours =
+                input.home_hours ??
+                (Array.isArray(current.home_hours)
+                  ? current.home_hours.map((h: any) => ({
+                      day: h.day,
+                      start_time: h.start_time,
+                      end_time: h.end_time,
+                    }))
+                  : []);
+              if (hours.length > 0) payload.home_hours = hours;
+            } else if (input.is_home_service === false) {
+              payload.is_home_service = '0';
+            }
             return api.putViaPost(`/offers/${input.id}`, payload, {
               multipart: true,
             });
