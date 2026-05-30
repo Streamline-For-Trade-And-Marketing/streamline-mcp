@@ -612,7 +612,7 @@ export function buildTools(api: VendorClient): ToolDef[] {
     {
       name: 'branch',
       description:
-        'Manage branches.\n\nACTIONS:\n• `list` — list branches. Optional: without_pagination (default true).\n• `get` — one branch by id. Required: id.\n• `create` — new branch. Required: name (Arabic), manager_id, country_id, region_id, city_id, address, lat, long (strings), official_hours (array of `{day, start_time, end_time}` per working day).\n• `update` — update one branch. Required: id. All other fields optional — current values echoed when omitted.\n• `activate` / `deactivate` — toggle is_active. Required: id. Deactivated branches stop accepting new bookings; existing ones stay intact.\n\nWhen the user references a branch by name, call `list` first to map it to its id. Never expose the id back to the user.',
+        'Manage branches.\n\nACTIONS:\n• `list` — list branches. Optional: without_pagination (default true).\n• `get` — one branch by id. Required: id.\n• `create` — new branch. Required: name (Arabic), manager_id, country_id, region_id, city_id, address, lat, long (strings), official_hours (array of `{day, start_time, end_time}` per working day). Optional home-delivery pricing fields: home_pricing_type, home_fixed_fee, home_pricing_tiers.\n• `update` — update one branch. Required: id. All other fields optional — current values echoed when omitted.\n• `activate` / `deactivate` — toggle is_active. Required: id. Deactivated branches stop accepting new bookings; existing ones stay intact.\n\nHOME-DELIVERY PRICING (June-2026, backend commit 721b85c):\n• `home_pricing_type` — `"fixed"` (one flat surcharge for every home booking — the legacy behaviour) OR `"by_distance"` (minute-tiers based on one-way driving time).\n• `home_fixed_fee` — used when type=fixed. Number ≥ 0.\n• `home_pricing_tiers` — used when type=by_distance. Array of `{up_to_minutes, fee}` ordered nearest-first. Each tier covers customers within that one-way-minute bound; the LAST tier\'s `up_to_minutes` is the branch\'s coverage radius (customers farther than that are "out of coverage" and can\'t book home delivery). Sync\'d delete-then-recreate on every branch save, so re-send the full tier list when updating.\n\nWhen the user references a branch by name, call `list` first to map it to its id. Never expose the id back to the user.',
       inputSchema: z.object({
         action: z.enum([
           'list',
@@ -633,6 +633,19 @@ export function buildTools(api: VendorClient): ToolDef[] {
         lat: z.string().min(2).optional(),
         long: z.string().min(2).optional(),
         official_hours: z.array(hourRowSchema).optional(),
+        home_pricing_type: z.enum(['fixed', 'by_distance']).optional(),
+        home_fixed_fee: z.number().nonnegative().optional(),
+        home_pricing_tiers: z
+          .array(
+            z.object({
+              up_to_minutes: z.number().int().min(1),
+              fee: z.number().nonnegative(),
+            }),
+          )
+          .optional()
+          .describe(
+            'Distance-pricing tiers ordered nearest-first. Last tier\'s up_to_minutes is the coverage radius.',
+          ),
       }),
       handler: async (input) => {
         switch (input.action) {
@@ -663,21 +676,33 @@ export function buildTools(api: VendorClient): ToolDef[] {
               ],
               'create',
             );
-            return api.post(
-              '/branches',
-              {
-                name: input.name,
-                manager_id: input.manager_id,
-                country_id: input.country_id,
-                region_id: input.region_id,
-                city_id: input.city_id,
-                address: input.address,
-                lat: input.lat,
-                long: input.long,
-                official_hours: input.official_hours,
-              },
-              { multipart: true },
-            );
+            const payload: Record<string, any> = {
+              name: input.name,
+              manager_id: input.manager_id,
+              country_id: input.country_id,
+              region_id: input.region_id,
+              city_id: input.city_id,
+              address: input.address,
+              lat: input.lat,
+              long: input.long,
+              official_hours: input.official_hours,
+            };
+            // Home-delivery pricing. Backend's syncHomePricingTiers
+            // is delete-then-recreate: when type='by_distance' we MUST
+            // send the full tier list (otherwise it wipes them);
+            // when type='fixed' or omitted the tiers get cleared and
+            // home_fixed_fee is what charges.
+            if (input.home_pricing_type) {
+              payload.home_pricing_type = input.home_pricing_type;
+              if (input.home_pricing_type === 'by_distance') {
+                if (input.home_pricing_tiers && input.home_pricing_tiers.length > 0)
+                  payload.home_pricing_tiers = input.home_pricing_tiers;
+              } else {
+                if (input.home_fixed_fee !== undefined)
+                  payload.home_fixed_fee = input.home_fixed_fee;
+              }
+            }
+            return api.post('/branches', payload, { multipart: true });
           }
           case 'update': {
             require(input, ['id'], 'update');
@@ -689,34 +714,63 @@ export function buildTools(api: VendorClient): ToolDef[] {
                   end_time: h.end_time,
                 }))
               : [];
-            return api.putViaPost(
-              `/branches/${input.id}`,
-              {
-                name: input.name ?? current.name ?? '',
-                manager_id:
-                  input.manager_id ??
-                  current.manager?.id ??
-                  current.manager_id,
-                country_id:
-                  input.country_id ??
-                  current.country?.id ??
-                  current.country_id,
-                region_id:
-                  input.region_id ??
-                  current.region?.id ??
-                  current.region_id,
-                city_id:
-                  input.city_id ?? current.city?.id ?? current.city_id,
-                address: input.address ?? current.address ?? '',
-                lat: input.lat ?? String(current.lat ?? ''),
-                long: input.long ?? String(current.long ?? ''),
-                official_hours:
-                  input.official_hours && input.official_hours.length > 0
-                    ? input.official_hours
-                    : currentHours,
-              },
-              { multipart: true },
-            );
+            const currentTiers = Array.isArray(current.home_pricing_tiers)
+              ? current.home_pricing_tiers.map((t: any) => ({
+                  up_to_minutes: Number(t.up_to_minutes),
+                  fee: Number(t.fee),
+                }))
+              : [];
+            const payload: Record<string, any> = {
+              name: input.name ?? current.name ?? '',
+              manager_id:
+                input.manager_id ??
+                current.manager?.id ??
+                current.manager_id,
+              country_id:
+                input.country_id ??
+                current.country?.id ??
+                current.country_id,
+              region_id:
+                input.region_id ??
+                current.region?.id ??
+                current.region_id,
+              city_id:
+                input.city_id ?? current.city?.id ?? current.city_id,
+              address: input.address ?? current.address ?? '',
+              lat: input.lat ?? String(current.lat ?? ''),
+              long: input.long ?? String(current.long ?? ''),
+              official_hours:
+                input.official_hours && input.official_hours.length > 0
+                  ? input.official_hours
+                  : currentHours,
+            };
+            // Home-pricing round-trip. The backend ALWAYS wipes tiers
+            // on update and re-creates only when type='by_distance', so
+            // we must echo the current tiers when staying on by_distance
+            // without an explicit edit. When the caller flips type to
+            // 'fixed' the existing tiers should disappear — the backend
+            // wipes them automatically without us sending anything.
+            const resolvedType =
+              input.home_pricing_type ?? current.home_pricing_type ?? null;
+            if (resolvedType) {
+              payload.home_pricing_type = resolvedType;
+              if (resolvedType === 'by_distance') {
+                const tiers =
+                  input.home_pricing_tiers &&
+                  input.home_pricing_tiers.length > 0
+                    ? input.home_pricing_tiers
+                    : currentTiers;
+                if (tiers.length > 0) payload.home_pricing_tiers = tiers;
+              } else {
+                if (input.home_fixed_fee !== undefined)
+                  payload.home_fixed_fee = input.home_fixed_fee;
+                else if (current.home_fixed_fee !== undefined)
+                  payload.home_fixed_fee = current.home_fixed_fee;
+              }
+            }
+            return api.putViaPost(`/branches/${input.id}`, payload, {
+              multipart: true,
+            });
           }
           case 'activate':
           case 'deactivate':
