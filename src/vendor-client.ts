@@ -9,17 +9,19 @@
  * Arabic only and several suppression rules key off literal Arabic
  * strings; copying that decision here keeps the two surfaces in sync.
  *
- * Rate limiting: the backend enforces 60 req/min globally per token,
- * so we cap our own throughput one notch below (50/min) to leave room
- * for the mobile app pinging from the same account. Requests beyond
- * the cap queue and resolve in order — never silent-drop.
+ * Rate limiting: the backend raised its global throttle to 200 req/min
+ * (backend commit e0db626, keyed by user id with an IP fallback), so we
+ * cap our own throughput below that (150/min) to leave headroom for the
+ * mobile app pinging from the same vendor account. Requests beyond the
+ * cap queue and resolve in order — never silent-drop.
  */
 import axios, { AxiosError, AxiosInstance } from 'axios';
 
 const DEFAULT_BASE = 'https://api.streamline.com.sa/vendor/v1';
-// One notch below the backend's 60/min cap so a Claude conversation
-// running alongside an open mobile app doesn't 429 either of them.
-const RATE_LIMIT_PER_MIN = 50;
+// Below the backend's 200/min cap (raised from 60 in commit e0db626) so a
+// Claude conversation running alongside an open mobile app — both keyed to
+// the same vendor user id — doesn't 429 either of them.
+const RATE_LIMIT_PER_MIN = 150;
 const WINDOW_MS = 60_000;
 
 /**

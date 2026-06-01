@@ -73,26 +73,40 @@ function clean<T extends Record<string, any>>(o: T): Record<string, any> {
 }
 
 /**
- * Guard: refuse to mutate a booking whose status is already `completed`.
+ * Build a NON-BLOCKING notice for an action on an already-`completed`
+ * booking. This does NOT throw — it returns advisory text (or null).
  *
- * The backend's `BookingRequest` validator allows `status` to transition
- * from anything to anything — that's intentional on the backend (admin
- * tooling sometimes needs to retro-fix records) but for vendor
- * conversations through Claude it's a footgun: a completed booking has
- * an issued invoice and balanced wallet transactions, and any status
- * flip after that desyncs reports and tax records.
+ * History: this used to be a hard block (`ensureNotCompleted`) added
+ * "per vendor instruction" because a completed booking has an issued,
+ * ZATCA-immutable invoice and any status flip desynced reports. The
+ * backend has since gained credit-note (إشعار دائن, amount down) /
+ * debit-note (إشعار مدين, amount up) support: editing or cancelling a
+ * completed booking no longer rewrites the original invoice — the
+ * backend issues a note that REFERENCES it and adjusts the EFFECTIVE
+ * total (net_total / net_vat) while the original total / vat stay
+ * frozen. So the operation is now safe to let through.
  *
- * Per vendor instruction: completed bookings are FINAL — block at this
- * layer. Notes-only edits are NOT blocked because they're metadata.
+ * Per vendor instruction the block was REMOVED in favour of this
+ * advisory ("شيلها وحط تنبيه"): let the action proceed, but warn the
+ * vendor that a credit/debit note will be issued so the money trail is
+ * understood. Returns the warning when the booking is completed, else
+ * null (the common path stays silent).
  */
-function ensureNotCompleted(detail: any, action: string): void {
+function completedBookingNotice(detail: any, action: string): string | null {
   const status = String(detail?.status ?? '').toLowerCase();
-  if (status === 'completed') {
-    const id = detail?.id ?? '?';
-    throw new Error(
-      `Cannot ${action} booking #${id} — its status is already "completed" and the invoice is issued. Completed bookings are final at this layer to keep reports and ZATCA invoices balanced. If a refund or correction is really needed, do it through the admin tool — not the vendor MCP.`,
-    );
-  }
+  if (status !== 'completed') return null;
+  const id = detail?.id ?? '?';
+  return `Heads up: booking #${id} is already "completed" and its tax invoice is issued. Proceeding to ${action} it will NOT rewrite that invoice — the backend issues a ZATCA credit/debit note (إشعار دائن/مدين) that references the original and adjusts the effective total (net_total/net_vat); the original total/vat stay frozen, so reports and ZATCA stay balanced. Surface this to the vendor before confirming.`;
+}
+
+/**
+ * Attach a non-blocking notice to a handler result so the calling agent
+ * sees it alongside the data (the dispatcher JSON-stringifies whatever
+ * the handler returns). When there's no notice the raw result is passed
+ * through untouched, so the common path keeps its normal response shape.
+ */
+function attachNotice(result: any, notice: string | null): any {
+  return notice ? { notice, result } : result;
 }
 
 /**
@@ -493,7 +507,7 @@ export function buildTools(api: VendorClient): ToolDef[] {
           case 'mark_no_show': {
             require(input, ['id'], input.action);
             const detail = await api.get(`/bookings/${input.id}`);
-            ensureNotCompleted(
+            const notice = completedBookingNotice(
               detail,
               input.action === 'mark_no_show'
                 ? 'mark as no-show'
@@ -533,16 +547,17 @@ export function buildTools(api: VendorClient): ToolDef[] {
               if (input.cancel_reason_id)
                 payload.cancel_reason_id = input.cancel_reason_id;
             }
-            return api.putViaPost(
-              `/bookings/${input.id}`,
-              clean(payload),
-              { multipart: true },
+            return attachNotice(
+              await api.putViaPost(`/bookings/${input.id}`, clean(payload), {
+                multipart: true,
+              }),
+              notice,
             );
           }
           case 'reschedule': {
             require(input, ['id'], 'reschedule');
             const detail = await api.get(`/bookings/${input.id}`);
-            ensureNotCompleted(detail, 'reschedule');
+            const notice = completedBookingNotice(detail, 'reschedule');
             let timestamp: number | undefined;
             if (input.local_datetime) {
               timestamp = saudiLocalToUnix(
@@ -558,13 +573,16 @@ export function buildTools(api: VendorClient): ToolDef[] {
             }
             const resolvedEmployeeId =
               input.employee_id ?? detail.employee?.id ?? detail.employee_id;
-            return api.post(
-              `/bookings/${input.id}/reschedule`,
-              clean({
-                booking_timestamp: timestamp,
-                employee_id: resolvedEmployeeId,
-              }),
-              { multipart: true },
+            return attachNotice(
+              await api.post(
+                `/bookings/${input.id}/reschedule`,
+                clean({
+                  booking_timestamp: timestamp,
+                  employee_id: resolvedEmployeeId,
+                }),
+                { multipart: true },
+              ),
+              notice,
             );
           }
           case 'update_notes': {
@@ -612,7 +630,7 @@ export function buildTools(api: VendorClient): ToolDef[] {
     {
       name: 'branch',
       description:
-        'Manage branches.\n\nACTIONS:\n• `list` — list branches. Optional: without_pagination (default true).\n• `get` — one branch by id. Required: id.\n• `create` — new branch. Required: name (Arabic), manager_id, country_id, region_id, city_id, address, lat, long (strings), official_hours (array of `{day, start_time, end_time}` per working day). Optional home-delivery pricing fields: home_pricing_type, home_fixed_fee, home_pricing_tiers.\n• `update` — update one branch. Required: id. All other fields optional — current values echoed when omitted.\n• `activate` / `deactivate` — toggle is_active. Required: id. Deactivated branches stop accepting new bookings; existing ones stay intact.\n\nHOME-DELIVERY PRICING (June-2026, backend commit 721b85c):\n• `home_pricing_type` — `"fixed"` (one flat surcharge for every home booking — the legacy behaviour) OR `"by_distance"` (minute-tiers based on one-way driving time).\n• `home_fixed_fee` — used when type=fixed. Number ≥ 0.\n• `home_pricing_tiers` — used when type=by_distance. Array of `{up_to_minutes, fee}` ordered nearest-first. Each tier covers customers within that one-way-minute bound; the LAST tier\'s `up_to_minutes` is the branch\'s coverage radius (customers farther than that are "out of coverage" and can\'t book home delivery). Sync\'d delete-then-recreate on every branch save, so re-send the full tier list when updating.\n\nWhen the user references a branch by name, call `list` first to map it to its id. Never expose the id back to the user.',
+        'Manage branches.\n\nACTIONS:\n• `list` — list branches. Optional: without_pagination (default true).\n• `get` — one branch by id. Required: id.\n• `create` — new branch. Required: name (Arabic), manager_id, country_id, region_id, city_id, address, lat, long (strings), official_hours (array of `{day, start_time, end_time}` per working day). Optional home-delivery fields: offers_home_services, is_cloud, home_pricing_type, home_fixed_fee, home_pricing_tiers.\n• `update` — update one branch. Required: id. All other fields optional — current values echoed when omitted.\n• `activate` / `deactivate` — toggle is_active. Required: id. Deactivated branches stop accepting new bookings; existing ones stay intact.\n\nHOME-CAPABILITY FLAGS (June-2026, backend commit 0158345):\n• `offers_home_services` — master switch. When true the branch surfaces a home-delivery section to customers and the per-service home toggles + branch pricing below take effect. When false there is no home section at all.\n• `is_cloud` — a "cloud" (سحابي) branch: home-ONLY, no in-shop visits. Its ENTIRE active catalogue is delivered to the customer and home availability follows the branch official_hours (cloud services carry no per-service home_hours). Setting is_cloud=true implies offers_home_services=true (the backend normalises this; this tool mirrors it).\n• Both echo back in `get` (list + detail) alongside the public storefront `slug`.\n\nHOME-DELIVERY PRICING (June-2026, backend commit 721b85c) — only meaningful when offers_home_services=true:\n• `home_pricing_type` — `"fixed"` (one flat surcharge for every home booking — the legacy behaviour) OR `"by_distance"` (minute-tiers based on one-way driving time).\n• `home_fixed_fee` — used when type=fixed. Number ≥ 0.\n• `home_pricing_tiers` — used when type=by_distance. Array of `{up_to_minutes, fee}` ordered nearest-first. Each tier covers customers within that one-way-minute bound; the LAST tier\'s `up_to_minutes` is the branch\'s coverage radius (customers farther than that are "out of coverage" and can\'t book home delivery). Sync\'d delete-then-recreate on every branch save, so re-send the full tier list when updating.\n\nWhen the user references a branch by name, call `list` first to map it to its id. Never expose the id back to the user.',
       inputSchema: z.object({
         action: z.enum([
           'list',
@@ -633,6 +651,18 @@ export function buildTools(api: VendorClient): ToolDef[] {
         lat: z.string().min(2).optional(),
         long: z.string().min(2).optional(),
         official_hours: z.array(hourRowSchema).optional(),
+        offers_home_services: z
+          .boolean()
+          .optional()
+          .describe(
+            'Master switch: does this branch offer home delivery at all? Required true for any home pricing / per-service home toggle to take effect.',
+          ),
+        is_cloud: z
+          .boolean()
+          .optional()
+          .describe(
+            'Home-ONLY ("cloud") branch — whole catalogue delivered, no in-shop visits. Implies offers_home_services=true.',
+          ),
         home_pricing_type: z.enum(['fixed', 'by_distance']).optional(),
         home_fixed_fee: z.number().nonnegative().optional(),
         home_pricing_tiers: z
@@ -702,6 +732,15 @@ export function buildTools(api: VendorClient): ToolDef[] {
                   payload.home_fixed_fee = input.home_fixed_fee;
               }
             }
+            // Home-capability flags (June-2026). is_cloud (home-only)
+            // implies the master switch — the backend normalises this in
+            // prepareForValidation, we mirror it so the wire is consistent.
+            if (input.offers_home_services !== undefined)
+              payload.offers_home_services = bool01(input.offers_home_services);
+            if (input.is_cloud !== undefined) {
+              payload.is_cloud = bool01(input.is_cloud);
+              if (input.is_cloud) payload.offers_home_services = '1';
+            }
             return api.post('/branches', payload, { multipart: true });
           }
           case 'update': {
@@ -767,6 +806,17 @@ export function buildTools(api: VendorClient): ToolDef[] {
                 else if (current.home_fixed_fee !== undefined)
                   payload.home_fixed_fee = current.home_fixed_fee;
               }
+            }
+            // Home-capability flags — pass through only when provided.
+            // The backend update uses $request->except(), so omitted
+            // flags keep their stored value (no echo needed). is_cloud
+            // implies the master switch — mirror of the backend's
+            // prepareForValidation so the wire stays self-consistent.
+            if (input.offers_home_services !== undefined)
+              payload.offers_home_services = bool01(input.offers_home_services);
+            if (input.is_cloud !== undefined) {
+              payload.is_cloud = bool01(input.is_cloud);
+              if (input.is_cloud) payload.offers_home_services = '1';
             }
             return api.putViaPost(`/branches/${input.id}`, payload, {
               multipart: true,
@@ -866,7 +916,7 @@ export function buildTools(api: VendorClient): ToolDef[] {
     {
       name: 'service',
       description:
-        'Manage services.\n\nACTIONS:\n• `list` — list services. Optional filters: branch_id, section_id, is_active (`0`/`1`), q, per_page.\n• `get` — one service by id. Required: id.\n• `create` — new service. Required: name_ar (≥2), description_ar (≥2), price, service_time (minutes), section_id, branch_id (array of ids). Optional: extra_time, featured, is_home_service + home_service_fee + home_hours (array of `{day, start_time, end_time}`).\n• `update` — full update. Required: id. All other fields optional — current values echoed when omitted.\n• `update_price` — fast price-only edit. Required: id, price. Optional: service_time, featured.\n• `activate` / `deactivate` — toggle is_active. Required: id.\n\nArabic-only. Home-service toggle: setting `is_home_service: false` WIPES existing home_hours server-side; setting it true requires `home_hours` to be passed alongside.\n\nCONFIRM the diff with the vendor before every write action.',
+        'Manage services.\n\nACTIONS:\n• `list` — list services. Optional filters: branch_id, section_id, is_active (`0`/`1`), q, per_page.\n• `get` — one service by id. Required: id.\n• `create` — new service. Required: name_ar (≥2), description_ar (≥2), price, service_time (minutes), section_id, branch_id (array of ids). Optional: extra_time, featured, is_home_service + home_service_fee + home_only + home_hours (array of `{day, start_time, end_time}`).\n• `update` — full update. Required: id. All other fields optional — current values echoed when omitted.\n• `update_price` — fast price-only edit. Required: id, price. Optional: service_time, featured.\n• `activate` / `deactivate` — toggle is_active. Required: id.\n\nArabic-only.\n\nHOME DELIVERY (June-2026):\n• `is_home_service` — per-service opt-in. Setting it FALSE wipes existing home_hours server-side AND force-resets home_only to 0.\n• `home_service_fee` — surcharge added on top of the base price for a home booking. Optional; defaults to 0 (charge base price).\n• `home_hours` — per-weekday windows the service is available at home. OPTIONAL even when is_home_service=true: a cloud-branch service carries none (home availability follows the branch official_hours), so omit them; pass windows only for a mixed in-shop+home service.\n• `home_only` — when true the service is delivered ONLY at home and is hidden from the in-shop catalogue sections. Composes with is_home_service and is ignored (force-reset to 0) unless is_home_service=true.\n\nCONFIRM the diff with the vendor before every write action.',
       inputSchema: z.object({
         action: z.enum([
           'list',
@@ -890,6 +940,12 @@ export function buildTools(api: VendorClient): ToolDef[] {
         extra_time: z.number().int().nonnegative().optional(),
         featured: z.boolean().optional(),
         is_home_service: z.boolean().optional(),
+        home_only: z
+          .boolean()
+          .optional()
+          .describe(
+            'Home-ONLY: deliver solely at the customer home and hide from in-shop sections. Composes with is_home_service; ignored unless is_home_service=true.',
+          ),
         home_service_fee: z.number().nonnegative().optional(),
         home_hours: z.array(hourRowSchema).optional(),
       }),
@@ -950,6 +1006,10 @@ export function buildTools(api: VendorClient): ToolDef[] {
               payload.featured = bool01(input.featured);
             if (input.is_home_service) {
               payload.is_home_service = '1';
+              // home_only only sticks for a home service; the backend
+              // force-resets it to 0 otherwise, so only send it here.
+              if (input.home_only !== undefined)
+                payload.home_only = bool01(input.home_only);
               if (input.home_service_fee !== undefined)
                 payload.home_service_fee = input.home_service_fee;
               if (input.home_hours && input.home_hours.length > 0)
@@ -1000,6 +1060,15 @@ export function buildTools(api: VendorClient): ToolDef[] {
                 : Number(current.is_home_service) === 1;
             if (homeOn) {
               payload.is_home_service = '1';
+              // Echo home_only so an unrelated edit doesn't drop it.
+              // (The backend preserves an omitted home_only while the
+              // service stays a home service, but echoing keeps the wire
+              // explicit and consistent with the other home fields.)
+              const homeOnly =
+                input.home_only !== undefined
+                  ? input.home_only
+                  : Number(current.home_only) === 1;
+              payload.home_only = homeOnly ? '1' : '0';
               if (input.home_service_fee !== undefined)
                 payload.home_service_fee = input.home_service_fee;
               else if (current.home_service_fee !== undefined)
@@ -1064,7 +1133,7 @@ export function buildTools(api: VendorClient): ToolDef[] {
     {
       name: 'offer',
       description:
-        'Manage promotional offers.\n\nACTIONS:\n• `list` — list offers. Optional: branch_id, per_page.\n• `get` — one offer by id. Required: id.\n• `create` — new offer. Required: name_ar, description_ar, section_id, service_ids (array), branch_id (array), price_type, service_price. Conditional: discount_percentage (when price_type="discount"), offer_price (when price_type="special"). Optional home-service fields: is_home_service, home_service_fee, home_hours.\n• `update` — update one. Required: id. All other fields optional.\n• `activate` / `deactivate` — toggle is_active. Required: id.\n\nPRICE-TYPE SEMANTICS:\n• `service` → offer_price = service_price, discount = 0 (no discount; the offer is just bundling).\n• `free` → offer_price = 0, discount = 100 (100% off).\n• `discount` → caller provides discount_percentage; offer_price auto-computed.\n• `special` → caller provides offer_price; discount_percentage auto-computed.\n\nHOME-SERVICE (May-2026): offers can be flagged as home-delivery just like services. Pass `is_home_service: true` AND `home_hours: [{day, start_time, end_time}, ...]` to mark the offer as available at the customer\'s home. Optional `home_service_fee` is the surcharge layered on top of the offer\'s price. Toggling is_home_service OFF will WIPE existing home_hours server-side (delete-all-then-insert sync).\n\nArabic-only. CONFIRM the pricing math with the vendor before write actions.',
+        'Manage promotional offers.\n\nACTIONS:\n• `list` — list offers. Optional: branch_id, per_page.\n• `get` — one offer by id. Required: id.\n• `create` — new offer. Required: name_ar, description_ar, section_id, service_ids (array), branch_id (array), price_type, service_price. Conditional: discount_percentage (when price_type="discount"), offer_price (when price_type="special"). Optional home-delivery fields: is_home_service, home_service_fee, home_only, home_hours.\n• `update` — update one. Required: id. All other fields optional.\n• `activate` / `deactivate` — toggle is_active. Required: id.\n\nPRICE-TYPE SEMANTICS:\n• `service` → offer_price = service_price, discount = 0 (no discount; the offer is just bundling).\n• `free` → offer_price = 0, discount = 100 (100% off).\n• `discount` → caller provides discount_percentage; offer_price auto-computed.\n• `special` → caller provides offer_price; discount_percentage auto-computed.\n\nHOME DELIVERY (May/June-2026): offers can be flagged for home delivery just like services.\n• `is_home_service: true` marks the offer available at the customer\'s home. Toggling it OFF WIPES existing home_hours server-side AND force-resets home_only to 0.\n• `home_service_fee` — optional surcharge layered on top of the offer price.\n• `home_hours: [{day, start_time, end_time}, ...]` — per-weekday windows. Pass them for a mixed in-shop+home offer; a cloud-branch offer carries none (home availability follows the branch official_hours).\n• `home_only: true` — deliver ONLY at home and hide the offer from the in-shop storefront sections. Composes with is_home_service and is ignored (force-reset to 0) unless is_home_service=true.\n\nArabic-only. CONFIRM the pricing math with the vendor before write actions.',
       inputSchema: z.object({
         action: z.enum([
           'list',
@@ -1090,6 +1159,12 @@ export function buildTools(api: VendorClient): ToolDef[] {
         // Same shape as the `service` umbrella's home fields so
         // vendors and the backend treat the two interchangeably.
         is_home_service: z.boolean().optional(),
+        home_only: z
+          .boolean()
+          .optional()
+          .describe(
+            'Home-ONLY: deliver solely at the customer home and hide from in-shop sections. Composes with is_home_service; ignored unless is_home_service=true.',
+          ),
         home_service_fee: z
           .number()
           .nonnegative()
@@ -1101,7 +1176,7 @@ export function buildTools(api: VendorClient): ToolDef[] {
           .array(hourRowSchema)
           .optional()
           .describe(
-            'Required when is_home_service=true. Per-weekday windows when the offer can be booked at the customer\'s home.',
+            'Per-weekday windows when the offer can be booked at home. Pass for a mixed in-shop+home offer; omit for a cloud-branch offer (follows the branch hours).',
           ),
       }),
       handler: async (input) => {
@@ -1190,6 +1265,10 @@ export function buildTools(api: VendorClient): ToolDef[] {
             // column to 0 and no home_hours rows are inserted.
             if (input.is_home_service) {
               payload.is_home_service = '1';
+              // home_only only sticks for a home offer; the backend
+              // force-resets it to 0 otherwise, so only send it here.
+              if (input.home_only !== undefined)
+                payload.home_only = bool01(input.home_only);
               if (input.home_service_fee !== undefined)
                 payload.home_service_fee = input.home_service_fee;
               if (input.home_hours && input.home_hours.length > 0)
@@ -1262,6 +1341,13 @@ export function buildTools(api: VendorClient): ToolDef[] {
                 : Boolean(current.is_home_service);
             if (homeOn) {
               payload.is_home_service = '1';
+              // Echo home_only so an unrelated edit doesn't drop it
+              // (mirrors the service umbrella).
+              const homeOnly =
+                input.home_only !== undefined
+                  ? input.home_only
+                  : Number(current.home_only) === 1;
+              payload.home_only = homeOnly ? '1' : '0';
               if (input.home_service_fee !== undefined)
                 payload.home_service_fee = input.home_service_fee;
               else if (current.home_service_fee !== undefined)
@@ -1602,7 +1688,7 @@ export function buildTools(api: VendorClient): ToolDef[] {
     {
       name: 'invoice',
       description:
-        'Read ZATCA-issued tax invoices.\n\nACTIONS:\n• `list` — paginated invoices. Optional: branch_id, per_page, page.\n• `get` — one invoice by id. Required: id.\n\nOnly meaningful for ZATCA-active vendors — non-ZATCA vendors don\'t generate invoices.',
+        'Read ZATCA-issued tax invoices.\n\nACTIONS:\n• `list` — paginated invoices. Optional: branch_id, per_page, page.\n• `get` — one invoice by id. Required: id.\n\nOnly meaningful for ZATCA-active vendors — non-ZATCA vendors don\'t generate invoices.\n\nRESPONSE FIELDS:\n• `total` / `vat` — the ORIGINAL issued amounts. Immutable by law once ZATCA accepts the invoice.\n• `net_total` / `net_vat` — the EFFECTIVE amounts after any credit/debit notes (original ± notes). Show net_total as the invoice\'s real collected value when it carries adjustments; fall back to `total` when net_total is absent.\n• `document_type` — `invoice` | `credit_note` | `debit_note`. The LIST only ever returns `invoice` rows; notes never appear as standalone list rows.\n• `zatca_status` — pending | skipped | reported | cleared | failed (plus zatca_environment, cleared_at, zatca_warnings, zatca_errors, zatca_attempts) for rendering submission-state badges.\n\nCREDIT / DEBIT NOTES (June-2026): an accepted invoice can\'t be edited — it is adjusted by a separate note that references it. A credit note (إشعار دائن) lowers the amount (cancellation / partial refund); a debit note (إشعار مدين) raises it. `get` nests them newest-first under `notes[]` (each: id, invoice_number, document_type, total, vat, note_reason, zatca_status, created_at) alongside the top-level `note_reason` / `reference_invoice_id`. The platform generates notes from booking changes — this MCP only READS them.',
       inputSchema: z.object({
         action: z.enum(['list', 'get']),
         id: idLike.optional(),
@@ -2050,7 +2136,7 @@ export function buildTools(api: VendorClient): ToolDef[] {
     {
       name: 'account',
       description:
-        'Manage the vendor account (changes that aren\'t covered by `get_profile`).\n\nACTIONS:\n• `change_password` — Required: current_password, new_password (≥8). Optional: new_password_confirmation (defaults to new_password).\n• `send_code` — request a 6-digit verification code (used before update_email / update_phone). Backend picks the delivery channel.\n• `update_email` — Required: email (valid format), code (6 digits from send_code).\n• `update_phone` — Required: phone (digits only, no + prefix), code (6 digits).\n• `update_profile` — change non-sensitive fields. Optional: name, first_name, last_name, bio, instagram_url, twitter_url, snapchat_url, tiktok_url, website_url.\n\nCONFIRM every account-touching action with the vendor before invoking.',
+        'Manage the vendor account (changes that aren\'t covered by `get_profile`).\n\nACTIONS:\n• `change_password` — Required: current_password, new_password (≥8). Optional: new_password_confirmation (defaults to new_password).\n• `send_code` — request a 6-digit verification code (used before update_email / update_phone). Backend picks the delivery channel.\n• `update_email` — Required: email (valid format), code (6 digits from send_code).\n• `update_phone` — Required: phone (digits only, no + prefix), code (6 digits).\n• `update_profile` — change profile fields. The backend ALWAYS requires first_name + last_name (≥5 chars each); this tool echoes the current values from get_profile when you omit them, so you can edit just one social link. Optional: first_name, last_name, description (bio, ≤200 chars), website_url (≤200), instagram (handle or URL, ≤200), tiktok (≤200), terms (vendor terms text). Note: socials are stored as plain strings — Twitter & Snapchat are retired backend-side and no longer accepted.\n\n⚠ update_profile RESETS THE PROFILE PHOTO. The backend clears the vendor avatar on any update-profile request that carries no image file, and this MCP cannot attach files — so every update_profile call removes the current photo. Tell the vendor this explicitly and get an OK before invoking.\n\nCONFIRM every account-touching action with the vendor before invoking.',
       inputSchema: z.object({
         action: z.enum([
           'change_password',
@@ -2065,15 +2151,32 @@ export function buildTools(api: VendorClient): ToolDef[] {
         email: z.string().email().optional(),
         phone: z.string().min(7).optional(),
         code: z.string().regex(/^\d{6}$/).optional(),
-        name: z.string().min(2).optional(),
         first_name: z.string().min(2).optional(),
         last_name: z.string().min(2).optional(),
-        bio: z.string().optional(),
-        instagram_url: z.string().url().optional(),
-        twitter_url: z.string().url().optional(),
-        snapchat_url: z.string().url().optional(),
-        tiktok_url: z.string().url().optional(),
-        website_url: z.string().url().optional(),
+        description: z
+          .string()
+          .min(3)
+          .max(200)
+          .optional()
+          .describe('Vendor bio / short description (≤200 chars).'),
+        website_url: z.string().min(3).max(200).optional(),
+        instagram: z
+          .string()
+          .min(3)
+          .max(200)
+          .optional()
+          .describe('Instagram handle or URL — stored as a plain string (≤200 chars).'),
+        tiktok: z
+          .string()
+          .min(3)
+          .max(200)
+          .optional()
+          .describe('TikTok handle or URL — stored as a plain string (≤200 chars).'),
+        terms: z
+          .string()
+          .min(3)
+          .optional()
+          .describe('Vendor terms & conditions text.'),
       }),
       handler: async (input) => {
         switch (input.action) {
@@ -2105,22 +2208,37 @@ export function buildTools(api: VendorClient): ToolDef[] {
               { phone: input.phone, code: input.code },
               { multipart: true },
             );
-          case 'update_profile':
+          case 'update_profile': {
+            // first_name + last_name are REQUIRED by the backend even
+            // for a socials-only edit — echo the stored values from
+            // /profile when the caller omits them so the update doesn't
+            // 422 on a missing name.
+            let firstName = input.first_name;
+            let lastName = input.last_name;
+            if (firstName === undefined || lastName === undefined) {
+              const current = await api.get('/profile');
+              firstName = firstName ?? current.first_name;
+              lastName = lastName ?? current.last_name;
+            }
+            // The backend reads exactly these vendor fields (description,
+            // website_url, instagram, tiktok, terms) + the required name
+            // pair. It also nulls the avatar when no image file is sent —
+            // see the ⚠ note in this tool's description; nothing to send
+            // for that here since this MCP can't attach a file.
             return api.post(
               '/update-profile',
               clean({
-                name: input.name,
-                first_name: input.first_name,
-                last_name: input.last_name,
-                bio: input.bio,
-                instagram_url: input.instagram_url,
-                twitter_url: input.twitter_url,
-                snapchat_url: input.snapchat_url,
-                tiktok_url: input.tiktok_url,
+                first_name: firstName,
+                last_name: lastName,
+                description: input.description,
                 website_url: input.website_url,
+                instagram: input.instagram,
+                tiktok: input.tiktok,
+                terms: input.terms,
               }),
               { multipart: true },
             );
+          }
         }
       },
     },
