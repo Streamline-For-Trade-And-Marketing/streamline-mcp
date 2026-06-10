@@ -165,7 +165,7 @@ app.get('/', (req, res, next) => {
 });
 
 app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', service: 'streamline-mcp', version: '0.6.2' });
+  res.json({ status: 'ok', service: 'streamline-mcp', version: '0.7.0' });
 });
 
 // ── OAuth discovery + endpoints ─────────────────────────────────
@@ -330,7 +330,7 @@ async function mcpHandler(req: Request, res: Response): Promise<void> {
   const toolsByName = new Map(tools.map((t) => [t.name, t]));
 
   const server = new Server(
-    { name: 'streamline-mcp', version: '0.6.2' },
+    { name: 'streamline-mcp', version: '0.7.0' },
     { capabilities: { tools: {} } },
   );
 
@@ -471,7 +471,7 @@ app.get('/sse', bearerAuth, async (req: Request, res: Response) => {
   const toolsByName = new Map(tools.map((t) => [t.name, t]));
 
   const server = new Server(
-    { name: 'streamline-mcp', version: '0.6.2' },
+    { name: 'streamline-mcp', version: '0.7.0' },
     { capabilities: { tools: {} } },
   );
 
