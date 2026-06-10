@@ -12,6 +12,7 @@
     "dev": "tsc --watch",
     "start": "node dist/index.js",
     "start:http": "node dist/http-server.js",
+    "start:chat": "node dist/chat-server.js",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

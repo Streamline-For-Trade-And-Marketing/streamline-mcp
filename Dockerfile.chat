@@ -1,0 +1,56 @@
+# syntax=docker/dockerfile:1.7
+#
+# Streamline AI **chat-server** image (POST /chat — Gemini drives the MCP tool
+# registry). Same build as the MCP Dockerfile; the ONLY differences are the
+# runtime command (dist/chat-server.js, not http-server.js), the port
+# (CHAT_PORT 8011) and the healthcheck path. Kept as a separate Dockerfile so
+# one repo can ship two Coolify resources: the MCP (mcp.streamline.com.sa) and
+# this chat-server, both from the same compiled dist/.
+
+# ─── Stage 1: build ─────────────────────────────────────────────
+FROM node:22-bookworm-slim AS build
+WORKDIR /app
+
+# Native build deps for better-sqlite3.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3 make g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY package.json package-lock.json* ./
+# --include=dev so tsc is present even when Coolify injects NODE_ENV=production
+# (see the MCP Dockerfile for the full rationale).
+RUN npm ci --include=dev
+
+COPY tsconfig.json ./
+COPY src ./src
+RUN npm run build
+
+RUN npm prune --omit=dev
+
+# ─── Stage 2: runtime ───────────────────────────────────────────
+FROM node:22-bookworm-slim AS runtime
+WORKDIR /app
+ENV NODE_ENV=production \
+    CHAT_PORT=8011 \
+    MCP_DB_PATH=/app/data/mcp.sqlite
+
+# curl for Coolify's external healthcheck shell probe; drop root.
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/* && \
+    useradd --system --uid 10001 --create-home mcp && \
+    mkdir -p /app/data && \
+    chown -R mcp:mcp /app
+
+COPY --from=build --chown=mcp:mcp /app/node_modules ./node_modules
+COPY --from=build --chown=mcp:mcp /app/dist ./dist
+COPY --from=build --chown=mcp:mcp /app/package.json ./package.json
+COPY --chown=mcp:mcp public ./public
+
+USER mcp
+EXPOSE 8011
+
+# chat-server exposes GET /health on CHAT_PORT.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:'+(process.env.CHAT_PORT||8011)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+
+CMD ["node", "dist/chat-server.js"]
