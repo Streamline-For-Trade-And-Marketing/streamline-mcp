@@ -48,7 +48,13 @@ function walk(schema: ZodTypeAny): JSONSchema {
   // Handle wrappers that delegate to an inner type first so we don't
   // miss their `description` / default / optional treatment.
   if (typeName === 'ZodOptional' || typeName === 'ZodNullable') {
-    return walk(def.innerType);
+    const inner = walk(def.innerType);
+    // `.optional().describe(...)` hangs the description on the WRAPPER —
+    // carry it through or it silently vanishes from tools/list.
+    if (def.description && !inner.description) {
+      inner.description = def.description;
+    }
+    return inner;
   }
   if (typeName === 'ZodDefault') {
     const inner = walk(def.innerType);
@@ -125,6 +131,12 @@ function walk(schema: ZodTypeAny): JSONSchema {
     }
     case 'ZodArray': {
       out = { type: 'array', items: walk(def.type) };
+      break;
+    }
+    case 'ZodRecord': {
+      // Id-keyed maps (e.g. booking sub_service_ids / prices): an open
+      // object whose values follow the record's value schema.
+      out = { type: 'object', additionalProperties: walk(def.valueType) };
       break;
     }
     case 'ZodAny':
