@@ -193,7 +193,7 @@ export class VendorClient {
   async post<T = any>(
     path: string,
     body?: Record<string, any>,
-    opts: { multipart?: boolean } = {},
+    opts: { multipart?: boolean; timeoutMs?: number } = {},
   ): Promise<T> {
     await this.bucket.take();
     try {
@@ -217,7 +217,14 @@ export class VendorClient {
         payload = fd;
         headers['Content-Type'] = 'multipart/form-data';
       }
-      const res = await this.axios.post(path, payload, { headers });
+      // Per-request timeout override — the Google-stats refresh endpoints
+      // scrape via Apify and legitimately run ~40-90s (the backend lifts
+      // its own limit with set_time_limit(300)); the default 20s would
+      // abort them client-side mid-scrape.
+      const res = await this.axios.post(path, payload, {
+        headers,
+        ...(opts.timeoutMs ? { timeout: opts.timeoutMs } : {}),
+      });
       return (res.data?.data ?? res.data) as T;
     } catch (err) {
       throw this.normaliseError(err);
@@ -245,7 +252,7 @@ export class VendorClient {
   async putViaPost<T = any>(
     path: string,
     body: Record<string, any>,
-    opts: { multipart?: boolean } = {},
+    opts: { multipart?: boolean; timeoutMs?: number } = {},
   ): Promise<T> {
     return this.post<T>(path, { ...body, _method: 'PUT' }, opts);
   }

@@ -1,14 +1,30 @@
 /**
- * Tool definitions for the Streamline MCP server (v0.6 — action-based).
+ * Tool definitions for the Streamline MCP server (v0.7 — action-based).
  *
- * Surface: **25 tools** (down from v0.5's 93). Every CRUD-style resource
- * is now exposed as ONE "umbrella" tool that takes an `action` enum.
- * Examples:
+ * Surface: **27 tools**. Every CRUD-style resource is exposed as ONE
+ * "umbrella" tool that takes an `action` enum. Examples:
  *   • `offer` covers list / get / create / update / activate / deactivate
  *   • `booking` covers list / get / create / cancel / complete /
  *      mark_no_show / reschedule / update_notes
  *   • `account` covers change_password / send_code / update_email /
  *      update_phone / update_profile
+ *
+ * v0.7 (June-2026) — synced with backend HEAD 8e5abd1:
+ *   • SUB-SERVICES (variants): services can carry variants (short/medium/
+ *     long) that supply price + duration. Booking a variant-only service
+ *     REQUIRES a `sub_service_ids` pick or the backend 400s
+ *     (api.sub_service_required). All booking write paths echo the
+ *     stored variant map so status edits never strip it.
+ *   • Vendor manual `discount` (flat SAR off a booking) + per-line
+ *     price/duration override maps on booking create/update.
+ *   • Google Calendar two-way sync tool + external-busy on the calendar.
+ *   • Google reviews/stats + Places linking on the branch tool.
+ *   • Packages + subscriptions tool (incl. free-plan self-activation).
+ *   • Reminders: per-channel contents + reset-defaults; channel toggles
+ *     fixed to the real backend contract (flat 0/1 flags).
+ *   • Package feature flags (config/features.php) gate some routes —
+ *     403 "هذه الميزة غير متاحة في باقتك الحالية" means the vendor's plan
+ *     lacks the feature, NOT a permissions problem.
  *
  * Why action-based: 93 distinct tools made the system prompt unwieldy
  * and forced Claude to scan a long list on every reply. Grouping by
@@ -157,6 +173,43 @@ function existingServiceAndOfferIds(detail: any): {
 }
 
 /**
+ * Rebuild the per-service chosen-variant map ({ service_id:
+ * sub_service_id }) from a booking detail's line items, standalone
+ * services only (offer lines keep their pinned variant server-side via
+ * the offer_services pivot).
+ *
+ * WHY THIS IS LOAD-BEARING (June-2026 sub-services): the backend's
+ * update path runs applyChosenSubServices(enforceChoice=true) over the
+ * re-sent service_ids. A variant-only service carries NULL parent
+ * price, so re-sending its service_id WITHOUT the variant map makes
+ * the whole update 400 (api.sub_service_required) — i.e. a plain
+ * status flip (cancel/complete/no-show) on a variant booking would
+ * fail. Echoing the stored map keeps the variant pinned and the
+ * update green. Mirrors the dashboard's getBookingSubServiceIds()
+ * (Frontend commit 266b8ea8).
+ */
+function existingSubServiceIds(detail: any): Record<string, any> {
+  const items =
+    detail?.booking_items ??
+    detail?.bookingService ??
+    detail?.booking_services ??
+    detail?.services ??
+    [];
+  const map: Record<string, any> = {};
+  if (Array.isArray(items)) {
+    items.forEach((it: any) => {
+      const offerId = it?.offer_id ?? it?.offer?.id ?? null;
+      const serviceId = it?.service_id ?? it?.service?.id ?? null;
+      const subId = it?.sub_service_id ?? it?.sub_service?.id ?? null;
+      if (offerId == null && serviceId != null && subId != null) {
+        map[String(serviceId)] = subId;
+      }
+    });
+  }
+  return map;
+}
+
+/**
  * Strip VAT / tax fields from a booking object when the vendor is
  * NOT ZATCA-active. The backend pre-computes 15% VAT into every
  * booking regardless of ZATCA status — mirroring the mobile app, we
@@ -202,6 +255,34 @@ const hourRowSchema = z.object({
   day: dayEnum,
   start_time: z.string().regex(hourPattern, 'HH:MM (24h) e.g. "09:00"'),
   end_time: z.string().regex(hourPattern, 'HH:MM (24h) e.g. "21:00"'),
+});
+
+/**
+ * A map keyed by service/offer id → value. Serialized to multipart as
+ * `key[<id>]=<value>` (the recursive FormData walker handles plain
+ * objects), which Laravel parses back into an id-keyed array — the
+ * exact shape the booking sub_service_ids / prices / durations /
+ * offer_prices / offer_durations validators expect.
+ */
+const idKeyedMap = z.record(z.union([z.number(), z.string()]));
+
+/**
+ * A sub-service (variant) row for the `service` umbrella. `id` MUST be
+ * echoed on edit — the backend's sync is id-aware: rows with a known id
+ * update in place (so offers/bookings that pinned the variant keep
+ * working), rows without an id are created, and stored variants missing
+ * from the array are soft-deleted (blocked with 400
+ * api.sub_service_used_in_offer if an offer still pins one).
+ */
+const subServiceRowSchema = z.object({
+  id: idLike.optional(),
+  name_ar: z.string().min(1),
+  name_en: z.string().optional(),
+  price: z.number().nonnegative(),
+  service_time: z.number().positive(),
+  extra_time: z.number().nonnegative().optional(),
+  sort: z.number().int().optional(),
+  is_active: z.boolean().optional(),
 });
 
 /** Convert MCP's boolean to Laravel's `'0'/'1'` string. */
@@ -267,6 +348,8 @@ const GLOBAL_CONVENTIONS = `**GLOBAL CONVENTIONS — APPLY TO EVERY REPLY:**
 
 • **ما يوجد DELETE** — this MCP cannot delete bookings / services / employees / branches / offers / promo codes / sections / roles / cancellation reasons. If the vendor asks to "احذف" something, suggest deactivation instead (\`action: "deactivate"\` on the umbrella tool) — the resource is hidden from customers without losing historical data.
 
+• **مزايا الباقة (feature flags)** — some capabilities are gated by the vendor's PACKAGE: تقييمات Google (google_reviews), الربط مع تقويم Google (google_calendar), إشعارات واتساب (whatsapp_notifications), التقارير المتقدمة (advanced_reports), مساعد Streamline AI (streamline_ai), Live Activity (live_activity). The \`get_profile\` response carries the effective map under \`features\`. A 403 reading "هذه الميزة غير متاحة في باقتك الحالية" means the PLAN lacks the feature — it is NOT a roles/permissions problem. Tell the vendor which feature their plan is missing and offer to show the available plans (\`subscription action="packages"\`), never retry the call.
+
 • **الواجهة بالعربي فقط** — the backend's \`name_en\` / \`description_en\` columns are nullable and NOT used by this MCP. Always send Arabic only. Never invent English placeholders.
 
 • **كل أداة تستخدم \`action\`** — every umbrella tool takes an \`action\` parameter (enum). For example, the \`offer\` tool's \`action\` selects between list / get / create / update / activate / deactivate. The tool's description spells out which other fields are required for each action.
@@ -286,7 +369,7 @@ export function buildTools(api: VendorClient): ToolDef[] {
     {
       name: 'get_profile',
       description:
-        'Get the logged-in vendor account profile: name, email, phone, role, active subscription summary, and social links. Use this FIRST in any conversation so you anchor on the vendor\'s actual context.\n\n' +
+        'Get the logged-in vendor account profile: name, email, phone, role, active subscription summary, and social links. Use this FIRST in any conversation so you anchor on the vendor\'s actual context.\n\nALSO RETURNS (June-2026):\n• `features` — the effective package feature map ({google_reviews, google_calendar, whatsapp_notifications, advanced_reports, streamline_ai, live_activity, zatca}: bool). Check it BEFORE suggesting a feature-gated action.\n• `account_active` — 0 means the admin deactivated this vendor account (dashboard is blocked).\n• `subscription_valid` — 0 means the subscription is expired/invalid; suggest `subscription action="packages"` to renew.\n\n' +
         GLOBAL_CONVENTIONS,
       inputSchema: z.object({}),
       handler: async () => api.get('/profile'),
@@ -340,7 +423,7 @@ export function buildTools(api: VendorClient): ToolDef[] {
     {
       name: 'get_calendar',
       description:
-        'Day-view list of bookings for a specific date + branch. Returns the same shape as `booking action="list"` but the backend filters to one day server-side, so this is the right tool for "اعرض جدول اليوم / show me tomorrow\'s calendar". `date` is YYYY-MM-DD. Optional employee_id narrows to one staff member.',
+        'Day-view list of bookings for a specific date + branch. Returns the same shape as `booking action="list"` but the backend filters to one day server-side, so this is the right tool for "اعرض جدول اليوم / show me tomorrow\'s calendar". `date` is YYYY-MM-DD. Optional employee_id narrows to one staff member.\n\nRESPONSE (June-2026 additions):\n• `employees[]` rows carry `branch_ids` (the branches each employee works in) — a booking can NOT be reassigned to an employee outside its branch.\n• A synthetic employee column `{id: 0, name: "بدون موظف"}` collects bookings whose employee was removed — they stay visible/editable.\n• `external_busy[]` — busy intervals from the vendor\'s connected Google Calendar (per employee: employee_id, event_id, calendar_id, title, start_time, end_time). These slots can\'t take bookings; manage the connection via the `google_calendar` tool.',
       inputSchema: z.object({
         branch_id: idLike,
         date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
@@ -353,12 +436,17 @@ export function buildTools(api: VendorClient): ToolDef[] {
     {
       name: 'preview_booking',
       description:
-        'Preview the price + duration + employee math for a potential booking WITHOUT creating it. Mirrors the in-app POS calculator — pass `branch_id` + `service_ids` (and/or `offer_ids`) + optional `employee_id`, and the backend returns the computed total, VAT (if ZATCA), per-service breakdown, and the available employees for those services. Use when the user asks "كم حصل لو حجز سمير حلاقة + لحية" before actually booking — gives them the number so they can decide. ALWAYS present the breakdown back to the user with options ("١) سجل الحجز / ٢) عدّل الخدمات / ٣) ألغ").',
+        'Preview the price + duration + employee math for a potential booking WITHOUT creating it. Mirrors the in-app POS calculator — pass `branch_id` + `service_ids` (and/or `offer_ids`) + optional `employee_id`, and the backend returns the computed total, VAT (if ZATCA), per-service breakdown, and the available employees for those services. Use when the user asks "كم حصل لو حجز سمير حلاقة + لحية" before actually booking — gives them the number so they can decide. ALWAYS present the breakdown back to the user with options ("١) سجل الحجز / ٢) عدّل الخدمات / ٣) ألغ").\n\nVARIANTS (June-2026): when a chosen service has sub-services (variants), pass `sub_service_ids` ({service_id: sub_service_id}) so the preview prices the chosen variant — a variant-only service carries NO base price of its own. Timeslots also honour the vendor\'s connected Google Calendar (externally-busy times are excluded).',
       inputSchema: z.object({
         branch_id: idLike.optional(),
         employee_id: idLike.optional(),
         service_ids: z.array(idLike).min(1).optional(),
         offer_ids: z.array(idLike).min(1).optional(),
+        sub_service_ids: idKeyedMap
+          .optional()
+          .describe(
+            'Chosen variant per service: { "<service_id>": <sub_service_id> }. Needed to price services that have variants.',
+          ),
       }),
       handler: async (input) =>
         api.post('/pos', clean(input), { multipart: true }),
@@ -379,7 +467,7 @@ export function buildTools(api: VendorClient): ToolDef[] {
     {
       name: 'booking',
       description:
-        'Manage bookings. Pick an `action` to scope the call.\n\nACTIONS:\n• `list` — paginated booking list. Optional filters: branch_id, employee_id, status (`confirmed`/`completed`/`canceled`/`missed`/`not_confirmed`), date (YYYY-MM-DD), q (free-text search by customer), page, per_page.\n• `get` — one booking by id. Required: id.\n• `create` — new booking. Required: branch_id, employee_id, ONE OF { service_ids OR offer_ids }, ONE OF { local_datetime OR booking_timestamp }. Optional: customer_id (omit for walk-in), notes, payment_way (`cash`/`online`, default cash), status (`confirmed`/`completed`), payment_status (0/1).\n• `cancel` — cancel a booking. Required: id. Optional: cancellation_reason (free text 2-500 chars), cancel_reason_id (from `cancellation_reason action="list"`). Refuses on completed bookings.\n• `complete` — mark customer-showed + sale-rung. Sets status=completed AND payment_status=1. Required: id. Refuses on already-completed.\n• `mark_no_show` — customer didn\'t show. Sets status=missed. Required: id. Refuses on completed.\n• `reschedule` — move to a new time / employee. Required: id AND ONE OF { local_datetime OR booking_timestamp }. Optional: employee_id (else re-uses current). Refuses on completed.\n• `update_notes` — append or replace notes. Required: id, notes. Optional: mode (`append`/`replace`, default replace). ALLOWED on completed bookings (metadata only).\n\n**Walk-in support:** when the vendor doesn\'t mention a customer for a create, OMIT customer_id entirely — the backend tags it as walk-in ("عميل تلقائي"). NEVER ask "which customer?" when the vendor didn\'t mention one.\n\n**Offers vs services:** booking a regular service uses `service_ids: [10, 22]`. Booking an offer/promotion uses `offer_ids: [5]` and the backend resolves the underlying services + discount automatically. Both arrays can be passed together if bundling.\n\n**Timezone:** pass `local_datetime: { date: "YYYY-MM-DD", time: "HH:MM" }` in Saudi-local and the server converts to unix. NEVER compute unix timestamps yourself.\n\nCONFIRM the full change with the vendor before every write action.',
+        'Manage bookings. Pick an `action` to scope the call.\n\nACTIONS:\n• `list` — paginated booking list. Optional filters: branch_id, employee_id, status (`confirmed`/`completed`/`canceled`/`missed`/`not_confirmed`), date (YYYY-MM-DD), q (free-text search by customer), page, per_page.\n• `get` — one booking by id. Required: id.\n• `create` — new booking. Required: branch_id, employee_id, ONE OF { service_ids OR offer_ids }, ONE OF { local_datetime OR booking_timestamp }. Optional: customer_id (omit for walk-in), notes, payment_way (`cash`/`online`, default cash), status (`confirmed`/`completed`), payment_status (0/1), sub_service_ids, prices, durations, offer_prices, offer_durations, discount.\n• `cancel` — cancel a booking. Required: id. Optional: cancellation_reason (free text 2-500 chars), cancel_reason_id (from `cancellation_reason action="list"`). On a completed booking this proceeds with a credit-note notice (see below).\n• `complete` — mark customer-showed + sale-rung. Sets status=completed AND payment_status=1. Required: id.\n• `mark_no_show` — customer didn\'t show. Sets status=missed. Required: id.\n• `reschedule` — move to a new time / employee. Required: id AND ONE OF { local_datetime OR booking_timestamp }. Optional: employee_id (else re-uses current), duration_minutes (explicit TOTAL block length — only pass when the vendor wants to stretch/shrink the slot; omitted = recomputed from the line items). Reassigning to an employee OUTSIDE the booking\'s branch is rejected (400) — bookings can\'t change branch.\n• `update_notes` — append or replace notes. Required: id, notes. Optional: mode (`append`/`replace`, default replace). ALLOWED on completed bookings (metadata only).\n\n**Walk-in support:** when the vendor doesn\'t mention a customer for a create, OMIT customer_id entirely — the backend tags it as walk-in ("عميل تلقائي"). NEVER ask "which customer?" when the vendor didn\'t mention one.\n\n**Offers vs services:** booking a regular service uses `service_ids: [10, 22]`. Booking an offer/promotion uses `offer_ids: [5]` and the backend resolves the underlying services + discount automatically. Both arrays can be passed together if bundling.\n\n**VARIANTS (sub-services, June-2026):** a service may have variants (e.g. حلاقة: قصير/متوسط/طويل — see `sub_services` on `service action="get"`). When booking such a service you MUST pass its chosen variant in `sub_service_ids` ({"<service_id>": <sub_service_id>}) — a variant-only service has no base price and the backend rejects the booking with "الخدمة لها خيارات؛ اختر أحد الخيارات" otherwise. Ask the vendor which variant the customer wants (present the variants as options with their prices). Status edits (cancel/complete/no-show/notes) re-attach the stored variant automatically — you don\'t need to.\n\n**PRICE / DURATION OVERRIDES + MANUAL DISCOUNT (June-2026):**\n• `prices` / `durations` — per-SERVICE override maps keyed by service id ({"10": 80} = charge 80 SAR for service 10 on THIS booking only). Missing entries fall back to the catalog/variant value (create) or the stored line value (update — overrides survive partial edits automatically).\n• `offer_prices` / `offer_durations` — same idea keyed by OFFER id.\n• `discount` — flat SAR amount off the booking total (vendor goodwill/haggling). Does NOT touch line prices; clamps so the total never goes negative; stacks on top of any promo code. Preserved automatically on later status edits.\n\n**External-calendar conflicts:** if the vendor has Google Calendar sync on and the employee\'s mapped calendar is busy at that time, `create` fails with 400 "هذا الوقت محجوز في تقويم الموظف (Google)" — offer the vendor a different slot.\n\n**Timezone:** pass `local_datetime: { date: "YYYY-MM-DD", time: "HH:MM" }` in Saudi-local and the server converts to unix. NEVER compute unix timestamps yourself.\n\nCONFIRM the full change with the vendor before every write action.',
       inputSchema: z.object({
         action: z.enum([
           'list',
@@ -412,6 +500,36 @@ export function buildTools(api: VendorClient): ToolDef[] {
         customer_id: idLike.optional(),
         service_ids: z.array(idLike).min(1).optional(),
         offer_ids: z.array(idLike).min(1).optional(),
+        sub_service_ids: idKeyedMap
+          .optional()
+          .describe(
+            'Chosen variant per service: { "<service_id>": <sub_service_id> }. REQUIRED for any service that has variants.',
+          ),
+        prices: idKeyedMap
+          .optional()
+          .describe(
+            'Per-service price override (SAR), keyed by service id. Missing entries use the catalog/variant price.',
+          ),
+        durations: idKeyedMap
+          .optional()
+          .describe(
+            'Per-service duration override (minutes 1-1440), keyed by service id.',
+          ),
+        offer_prices: idKeyedMap
+          .optional()
+          .describe('Per-offer price override (SAR), keyed by offer id.'),
+        offer_durations: idKeyedMap
+          .optional()
+          .describe(
+            'Per-offer duration override (minutes), keyed by offer id — distributed across the offer\'s services.',
+          ),
+        discount: z
+          .number()
+          .nonnegative()
+          .optional()
+          .describe(
+            'Vendor manual discount: flat SAR off the booking total. Stacks with promo codes; clamped to the subtotal.',
+          ),
         local_datetime: z
           .object({
             date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
@@ -425,6 +543,16 @@ export function buildTools(api: VendorClient): ToolDef[] {
         // cancel
         cancellation_reason: z.string().min(2).max(500).optional(),
         cancel_reason_id: idLike.optional(),
+        // reschedule
+        duration_minutes: z
+          .number()
+          .int()
+          .min(1)
+          .max(1440)
+          .optional()
+          .describe(
+            'Reschedule only: explicit TOTAL block length in minutes (calendar edge-resize). Omit on a plain move — the backend recomputes from the line items and keeps saved per-line overrides.',
+          ),
         // update_notes
         mode: z.enum(['append', 'replace']).optional(),
       }),
@@ -500,6 +628,30 @@ export function buildTools(api: VendorClient): ToolDef[] {
               payload.offer_ids = input.offer_ids;
             if (input.customer_id !== undefined && input.customer_id !== null)
               payload.customer_id = input.customer_id;
+            // June-2026: chosen variants + per-line overrides + manual
+            // discount. Maps go over the wire as key[<id>]=value, which
+            // Laravel parses into the id-keyed arrays the validator wants.
+            if (
+              input.sub_service_ids &&
+              Object.keys(input.sub_service_ids).length > 0
+            )
+              payload.sub_service_ids = input.sub_service_ids;
+            if (input.prices && Object.keys(input.prices).length > 0)
+              payload.prices = input.prices;
+            if (input.durations && Object.keys(input.durations).length > 0)
+              payload.durations = input.durations;
+            if (
+              input.offer_prices &&
+              Object.keys(input.offer_prices).length > 0
+            )
+              payload.offer_prices = input.offer_prices;
+            if (
+              input.offer_durations &&
+              Object.keys(input.offer_durations).length > 0
+            )
+              payload.offer_durations = input.offer_durations;
+            if (input.discount !== undefined)
+              payload.discount = input.discount;
             return api.post('/bookings', payload, { multipart: true });
           }
           case 'cancel':
@@ -541,6 +693,15 @@ export function buildTools(api: VendorClient): ToolDef[] {
             };
             if (service_ids.length > 0) payload.service_ids = service_ids;
             if (offer_ids.length > 0) payload.offer_ids = offer_ids;
+            // Re-attach each service's stored variant — without this a
+            // status flip on a variant booking 400s (sub_service_required)
+            // because the parent service carries no price of its own.
+            // prices/durations/discount are NOT echoed on purpose: the
+            // backend falls back to the stored line values when the keys
+            // are absent, so saved overrides survive untouched.
+            const subMap = existingSubServiceIds(detail);
+            if (Object.keys(subMap).length > 0)
+              payload.sub_service_ids = subMap;
             if (input.action === 'cancel') {
               if (input.cancellation_reason)
                 payload.cancellation_reason = input.cancellation_reason;
@@ -573,12 +734,18 @@ export function buildTools(api: VendorClient): ToolDef[] {
             }
             const resolvedEmployeeId =
               input.employee_id ?? detail.employee?.id ?? detail.employee_id;
+            // duration_minutes is the calendar edge-resize: an explicit
+            // TOTAL block length the backend persists by distributing it
+            // across the line items. Omitted on a plain move — the
+            // backend recomputes from stored per-line overrides → chosen
+            // variant → catalog, so the block keeps its saved length.
             return attachNotice(
               await api.post(
                 `/bookings/${input.id}/reschedule`,
                 clean({
                   booking_timestamp: timestamp,
                   employee_id: resolvedEmployeeId,
+                  duration_minutes: input.duration_minutes,
                 }),
                 { multipart: true },
               ),
@@ -613,6 +780,11 @@ export function buildTools(api: VendorClient): ToolDef[] {
             };
             if (service_ids.length > 0) payload.service_ids = service_ids;
             if (offer_ids.length > 0) payload.offer_ids = offer_ids;
+            // Same variant echo as the status actions — see the comment
+            // there. A notes edit must never strip a chosen variant.
+            const notesSubMap = existingSubServiceIds(detail);
+            if (Object.keys(notesSubMap).length > 0)
+              payload.sub_service_ids = notesSubMap;
             return api.putViaPost(
               `/bookings/${input.id}`,
               clean(payload),
@@ -630,7 +802,7 @@ export function buildTools(api: VendorClient): ToolDef[] {
     {
       name: 'branch',
       description:
-        'Manage branches.\n\nACTIONS:\n• `list` — list branches. Optional: without_pagination (default true).\n• `get` — one branch by id. Required: id.\n• `create` — new branch. Required: name (Arabic), manager_id, country_id, region_id, city_id, address, lat, long (strings), official_hours (array of `{day, start_time, end_time}` per working day). Optional home-delivery fields: offers_home_services, is_cloud, home_pricing_type, home_fixed_fee, home_pricing_tiers.\n• `update` — update one branch. Required: id. All other fields optional — current values echoed when omitted.\n• `activate` / `deactivate` — toggle is_active. Required: id. Deactivated branches stop accepting new bookings; existing ones stay intact.\n\nHOME-CAPABILITY FLAGS (June-2026, backend commit 0158345):\n• `offers_home_services` — master switch. When true the branch surfaces a home-delivery section to customers and the per-service home toggles + branch pricing below take effect. When false there is no home section at all.\n• `is_cloud` — a "cloud" (سحابي) branch: home-ONLY, no in-shop visits. Its ENTIRE active catalogue is delivered to the customer and home availability follows the branch official_hours (cloud services carry no per-service home_hours). Setting is_cloud=true implies offers_home_services=true (the backend normalises this; this tool mirrors it).\n• Both echo back in `get` (list + detail) alongside the public storefront `slug`.\n\nHOME-DELIVERY PRICING (June-2026, backend commit 721b85c) — only meaningful when offers_home_services=true:\n• `home_pricing_type` — `"fixed"` (one flat surcharge for every home booking — the legacy behaviour) OR `"by_distance"` (minute-tiers based on one-way driving time).\n• `home_fixed_fee` — used when type=fixed. Number ≥ 0.\n• `home_pricing_tiers` — used when type=by_distance. Array of `{up_to_minutes, fee}` ordered nearest-first. Each tier covers customers within that one-way-minute bound; the LAST tier\'s `up_to_minutes` is the branch\'s coverage radius (customers farther than that are "out of coverage" and can\'t book home delivery). Sync\'d delete-then-recreate on every branch save, so re-send the full tier list when updating.\n\nWhen the user references a branch by name, call `list` first to map it to its id. Never expose the id back to the user.',
+        'Manage branches.\n\nACTIONS:\n• `list` — list branches. Optional: without_pagination (default true). Rows include the Google-link state (google_place_id, show_google_reviews, google_rating, google_user_ratings_total).\n• `get` — one branch by id. Required: id.\n• `create` — new branch. Required: name (Arabic), manager_id, country_id, region_id, city_id, address, lat, long (strings), official_hours (array of `{day, start_time, end_time}` per working day). Optional home-delivery fields: offers_home_services, is_cloud, home_pricing_type, home_fixed_fee, home_pricing_tiers.\n• `update` — update one branch. Required: id. All other fields optional — current values echoed when omitted. Optional `existing_images` (see GALLERY below).\n• `activate` / `deactivate` — toggle is_active. Required: id. Deactivated branches stop accepting new bookings; existing ones stay intact.\n\nGOOGLE REVIEWS + STATS (June-2026, package feature `google_reviews`):\n• `places_search` — find the vendor\'s Google Business listing by name. Required: q (≥2 chars, e.g. "حلاق النخيل الرياض"). Returns candidate places with place_id — present them as options.\n• `places_details` — full details for one candidate. Required: place_id.\n• `set_google_place` — link/relink the branch to a Google place (pulls the live rating once). Required: id, google_place_id. To UNLINK pass google_place_id="" (also turns reviews display off).\n• `set_google_reviews` — toggle showing Google reviews on the customer storefront. Required: id, show_google_reviews. Fails 400 if the branch has no linked place yet.\n• `google_stats` — read the branch\'s cached Google stats snapshot (rating trends, review keywords, employee mentions, nearby competitors). Required: id.\n• `google_stats_refresh` — re-scrape from Google (TAKES ~40-90 SECONDS — tell the vendor it\'s working). Required: id. Optional scope: `all` (default, reviews+rating) / `employees` (re-detect employee mentions) / `competitors` (refresh competitor intelligence).\nA 403 "هذه الميزة غير متاحة في باقتك الحالية" on any of these means the vendor\'s package lacks the google_reviews feature.\n\nGALLERY (update only): this MCP can\'t upload images, but it CAN remove gallery images — pass `existing_images` = the array of image URLs to KEEP (from `get`.images); anything left out is deleted. Omit the field to leave the gallery untouched. CONFIRM the exact images being removed with the vendor first.\n\nHOME-CAPABILITY FLAGS (June-2026, backend commit 0158345):\n• `offers_home_services` — master switch. When true the branch surfaces a home-delivery section to customers and the per-service home toggles + branch pricing below take effect. When false there is no home section at all.\n• `is_cloud` — a "cloud" (سحابي) branch: home-ONLY, no in-shop visits. Its ENTIRE active catalogue is delivered to the customer and home availability follows the branch official_hours (cloud services carry no per-service home_hours). Setting is_cloud=true implies offers_home_services=true (the backend normalises this; this tool mirrors it).\n• Both echo back in `get` (list + detail) alongside the public storefront `slug`.\n\nHOME-DELIVERY PRICING (June-2026, backend commit 721b85c) — only meaningful when offers_home_services=true:\n• `home_pricing_type` — `"fixed"` (one flat surcharge for every home booking — the legacy behaviour) OR `"by_distance"` (minute-tiers based on one-way driving time).\n• `home_fixed_fee` — used when type=fixed. Number ≥ 0.\n• `home_pricing_tiers` — used when type=by_distance. Array of `{up_to_minutes, fee}` ordered nearest-first. Each tier covers customers within that one-way-minute bound; the LAST tier\'s `up_to_minutes` is the branch\'s coverage radius (customers farther than that are "out of coverage" and can\'t book home delivery). Sync\'d delete-then-recreate on every branch save, so re-send the full tier list when updating.\n\nWhen the user references a branch by name, call `list` first to map it to its id. Never expose the id back to the user.',
       inputSchema: z.object({
         action: z.enum([
           'list',
@@ -639,6 +811,12 @@ export function buildTools(api: VendorClient): ToolDef[] {
           'update',
           'activate',
           'deactivate',
+          'places_search',
+          'places_details',
+          'set_google_place',
+          'set_google_reviews',
+          'google_stats',
+          'google_stats_refresh',
         ]),
         id: idLike.optional(),
         without_pagination: z.boolean().optional(),
@@ -651,6 +829,34 @@ export function buildTools(api: VendorClient): ToolDef[] {
         lat: z.string().min(2).optional(),
         long: z.string().min(2).optional(),
         official_hours: z.array(hourRowSchema).optional(),
+        // Google reviews / Places (June-2026)
+        q: z
+          .string()
+          .min(2)
+          .optional()
+          .describe('places_search: business name to look up on Google.'),
+        place_id: z
+          .string()
+          .optional()
+          .describe('places_details: the candidate place_id to expand.'),
+        google_place_id: z
+          .string()
+          .max(255)
+          .optional()
+          .describe(
+            'set_google_place: the place to link. Empty string "" unlinks.',
+          ),
+        show_google_reviews: z.boolean().optional(),
+        scope: z
+          .enum(['all', 'employees', 'competitors'])
+          .optional()
+          .describe('google_stats_refresh: which part to re-scrape.'),
+        existing_images: z
+          .array(z.string())
+          .optional()
+          .describe(
+            'update only: gallery image URLs to KEEP — anything missing is DELETED. Omit to leave the gallery untouched.',
+          ),
         offers_home_services: z
           .boolean()
           .optional()
@@ -818,6 +1024,16 @@ export function buildTools(api: VendorClient): ToolDef[] {
               payload.is_cloud = bool01(input.is_cloud);
               if (input.is_cloud) payload.offers_home_services = '1';
             }
+            // Gallery management (June-2026, backend commit a60d358):
+            // manage_images=1 + existing_images[] = survivor URLs makes
+            // the backend delete everything NOT in the list and keep the
+            // rest. We can't upload new images over MCP, but removal
+            // works. Omitted → gallery untouched (no manage_images sent).
+            if (input.existing_images !== undefined) {
+              payload.manage_images = '1';
+              if (input.existing_images.length > 0)
+                payload.existing_images = input.existing_images;
+            }
             return api.putViaPost(`/branches/${input.id}`, payload, {
               multipart: true,
             });
@@ -826,6 +1042,60 @@ export function buildTools(api: VendorClient): ToolDef[] {
           case 'deactivate':
             require(input, ['id'], input.action);
             return api.post(`/branches/${input.id}/${input.action}`);
+          case 'places_search':
+            // Google Places autocomplete proxy (permission: branches.create).
+            require(input, ['q'], 'places_search');
+            return api.get('/branches/places/autocomplete', {
+              input: input.q,
+            });
+          case 'places_details':
+            require(input, ['place_id'], 'places_details');
+            return api.get('/branches/places/details', {
+              place_id: input.place_id,
+            });
+          case 'set_google_place': {
+            require(input, ['id'], 'set_google_place');
+            if (input.google_place_id === undefined) {
+              throw new Error(
+                'action="set_google_place" requires `google_place_id` — a place id (from places_search) to link, or "" to unlink.',
+              );
+            }
+            // Built without clean(): the empty string is the UNLINK
+            // signal and must survive to the wire.
+            return api.post(
+              `/branches/${input.id}/google-place`,
+              { google_place_id: input.google_place_id },
+              { multipart: true },
+            );
+          }
+          case 'set_google_reviews': {
+            require(input, ['id'], 'set_google_reviews');
+            if (input.show_google_reviews === undefined) {
+              throw new Error(
+                'action="set_google_reviews" requires `show_google_reviews` (true/false).',
+              );
+            }
+            return api.post(
+              `/branches/${input.id}/google-reviews`,
+              { show_google_reviews: bool01(input.show_google_reviews) },
+              { multipart: true },
+            );
+          }
+          case 'google_stats':
+            require(input, ['id'], 'google_stats');
+            return api.get(`/branches/${input.id}/google-stats`);
+          case 'google_stats_refresh': {
+            require(input, ['id'], 'google_stats_refresh');
+            const path =
+              input.scope === 'employees'
+                ? `/branches/${input.id}/google-stats/employees/refresh`
+                : input.scope === 'competitors'
+                  ? `/branches/${input.id}/google-stats/competitors/refresh`
+                  : `/branches/${input.id}/google-stats/refresh`;
+            // Apify scrape — the backend lifts its own limit to 300s;
+            // give the HTTP call 3 minutes instead of the default 20s.
+            return api.post(path, undefined, { timeoutMs: 180_000 });
+          }
         }
       },
     },
@@ -916,7 +1186,7 @@ export function buildTools(api: VendorClient): ToolDef[] {
     {
       name: 'service',
       description:
-        'Manage services.\n\nACTIONS:\n• `list` — list services. Optional filters: branch_id, section_id, is_active (`0`/`1`), q, per_page.\n• `get` — one service by id. Required: id.\n• `create` — new service. Required: name_ar (≥2), description_ar (≥2), price, service_time (minutes), section_id, branch_id (array of ids). Optional: extra_time, featured, is_home_service + home_service_fee + home_only + home_hours (array of `{day, start_time, end_time}`).\n• `update` — full update. Required: id. All other fields optional — current values echoed when omitted.\n• `update_price` — fast price-only edit. Required: id, price. Optional: service_time, featured.\n• `activate` / `deactivate` — toggle is_active. Required: id.\n\nArabic-only.\n\nHOME DELIVERY (June-2026):\n• `is_home_service` — per-service opt-in. Setting it FALSE wipes existing home_hours server-side AND force-resets home_only to 0.\n• `home_service_fee` — surcharge added on top of the base price for a home booking. Optional; defaults to 0 (charge base price).\n• `home_hours` — per-weekday windows the service is available at home. OPTIONAL even when is_home_service=true: a cloud-branch service carries none (home availability follows the branch official_hours), so omit them; pass windows only for a mixed in-shop+home service.\n• `home_only` — when true the service is delivered ONLY at home and is hidden from the in-shop catalogue sections. Composes with is_home_service and is ignored (force-reset to 0) unless is_home_service=true.\n\nCONFIRM the diff with the vendor before every write action.',
+        'Manage services.\n\nACTIONS:\n• `list` — list services. Optional filters: branch_id, section_id, is_active (`0`/`1`), q, per_page. Rows include `sub_services` + `has_sub_services`.\n• `get` — one service by id. Required: id. Includes `sub_services` (variants) + home_hours.\n• `create` — new service. Required: name_ar (≥2), description_ar (≥2), section_id, branch_id (array of ids), AND EITHER { price + service_time } OR a non-empty `sub_services` array (variants carry the pricing). Optional: extra_time, featured, is_home_service + home_service_fee + home_only + home_hours.\n• `update` — full update. Required: id. All other fields optional — current values echoed when omitted (INCLUDING the existing variants — see VARIANTS below).\n• `update_price` — fast price-only edit. Required: id, price. Optional: service_time, featured. NOTE: for a service WITH variants the parent price is ignored — edit the variant rows via `update` + `sub_services` instead.\n• `popular_templates` — admin-curated popular-service templates (name/description suggestions for quick creation). No params.\n• `activate` / `deactivate` — toggle is_active. Required: id.\n\nArabic-only.\n\nVARIANTS — sub_services (June-2026):\n• A service may carry variants (e.g. حلاقة → قصير/متوسط/طويل), each with its own name_ar, price, service_time, optional extra_time/sort/is_active. When a service HAS variants the parent price/service_time are NULL — the chosen variant prices the booking.\n• On `create`: pass `sub_services: [{name_ar, price, service_time, ...}]` and omit price/service_time.\n• On `update`: the sync is id-aware — rows WITH `id` update in place, rows without are created, and stored variants MISSING from the array are removed. THIS TOOL AUTO-ECHOES the current variants when you omit `sub_services`, so unrelated edits never wipe them. To remove a variant, send the array WITHOUT that row (keep the others, WITH their ids). Removing a variant still pinned by an offer fails with 400 "أحد الخيارات الفرعية مستخدم في عرض" — detach it from the offer first.\n• Bookings/offers reference variants by id — NEVER drop the `id` field when re-sending an existing variant.\n\nHOME DELIVERY (June-2026):\n• `is_home_service` — per-service opt-in. Setting it FALSE wipes existing home_hours server-side AND force-resets home_only to 0.\n• `home_service_fee` — surcharge added on top of the base price for a home booking. Optional; defaults to 0 (charge base price).\n• `home_hours` — per-weekday windows the service is available at home. OPTIONAL even when is_home_service=true: a cloud-branch service carries none (home availability follows the branch official_hours), so omit them; pass windows only for a mixed in-shop+home service.\n• `home_only` — when true the service is delivered ONLY at home and is hidden from the in-shop catalogue sections. Composes with is_home_service and is ignored (force-reset to 0) unless is_home_service=true.\n\nCONFIRM the diff with the vendor before every write action.',
       inputSchema: z.object({
         action: z.enum([
           'list',
@@ -924,6 +1194,7 @@ export function buildTools(api: VendorClient): ToolDef[] {
           'create',
           'update',
           'update_price',
+          'popular_templates',
           'activate',
           'deactivate',
         ]),
@@ -939,6 +1210,12 @@ export function buildTools(api: VendorClient): ToolDef[] {
         service_time: z.number().int().positive().optional(),
         extra_time: z.number().int().nonnegative().optional(),
         featured: z.boolean().optional(),
+        sub_services: z
+          .array(subServiceRowSchema)
+          .optional()
+          .describe(
+            'Variant rows. On update: omit entirely to keep the current variants (auto-echoed); include WITH ids to edit; leave a row out to remove it.',
+          ),
         is_home_service: z.boolean().optional(),
         home_only: z
           .boolean()
@@ -956,6 +1233,45 @@ export function buildTools(api: VendorClient): ToolDef[] {
           if (v === undefined || v === null) return undefined;
           return Array.isArray(v) ? v : [v];
         };
+        /**
+         * Normalise variant rows to the wire shape. Works for both the
+         * caller's zod rows (is_active boolean) and rows echoed from the
+         * backend detail (is_active enum-string '0'/'1'). Keeping `id`
+         * is what makes the backend's sync update-in-place instead of
+         * recreate — recreating would orphan offer pins + bookings.
+         */
+        const toSubServiceWire = (rows: any[]): any[] =>
+          rows
+            .filter(
+              (r) =>
+                r &&
+                r.name_ar &&
+                r.price !== undefined &&
+                r.price !== null &&
+                r.service_time !== undefined &&
+                r.service_time !== null,
+            )
+            .map((r) => {
+              const row: Record<string, any> = {
+                name_ar: r.name_ar,
+                price: r.price,
+                service_time: r.service_time,
+              };
+              if (r.id !== undefined && r.id !== null) row.id = r.id;
+              if (r.name_en) row.name_en = r.name_en;
+              if (r.extra_time !== undefined && r.extra_time !== null && r.extra_time !== '')
+                row.extra_time = r.extra_time;
+              if (r.sort !== undefined && r.sort !== null) row.sort = r.sort;
+              if (r.is_active !== undefined && r.is_active !== null) {
+                row.is_active =
+                  typeof r.is_active === 'boolean'
+                    ? bool01(r.is_active)
+                    : Number(r.is_active)
+                      ? '1'
+                      : '0';
+              }
+              return row;
+            });
         switch (input.action) {
           case 'list':
             return api.getRaw(
@@ -973,17 +1289,27 @@ export function buildTools(api: VendorClient): ToolDef[] {
           case 'get':
             require(input, ['id'], 'get');
             return api.get(`/services/${input.id}`);
+          case 'popular_templates':
+            // Admin-curated quick-create templates (name + description
+            // suggestions). Read-only; auth-only (no extra permission).
+            return api.get('/popular-services');
           case 'create': {
+            const hasVariants =
+              !!input.sub_services && input.sub_services.length > 0;
+            // With variants the parent price/service_time are optional —
+            // the backend nulls them anyway (variants carry the pricing).
             require(
               input,
-              [
-                'name_ar',
-                'description_ar',
-                'price',
-                'service_time',
-                'section_id',
-                'branch_id',
-              ],
+              hasVariants
+                ? ['name_ar', 'description_ar', 'section_id', 'branch_id']
+                : [
+                    'name_ar',
+                    'description_ar',
+                    'price',
+                    'service_time',
+                    'section_id',
+                    'branch_id',
+                  ],
               'create',
             );
             const branches = asBranchArray(input.branch_id);
@@ -995,11 +1321,14 @@ export function buildTools(api: VendorClient): ToolDef[] {
             const payload: Record<string, any> = {
               name_ar: input.name_ar,
               description_ar: input.description_ar,
-              price: input.price,
-              service_time: input.service_time,
               section_id: input.section_id,
               branch_id: branches,
             };
+            if (input.price !== undefined) payload.price = input.price;
+            if (input.service_time !== undefined)
+              payload.service_time = input.service_time;
+            if (hasVariants)
+              payload.sub_services = toSubServiceWire(input.sub_services!);
             if (input.extra_time !== undefined)
               payload.extra_time = input.extra_time;
             if (input.featured !== undefined)
@@ -1026,6 +1355,29 @@ export function buildTools(api: VendorClient): ToolDef[] {
                 ? [current.branch_id]
                 : [];
             const branches = asBranchArray(input.branch_id) ?? currentBranchIds;
+            // VARIANT ECHO (load-bearing): the backend's syncSubServices
+            // treats an absent/empty `sub_services` as "delete them all".
+            // Omitted by the caller → re-send the stored rows (with ids)
+            // so an unrelated edit never wipes the variants. An explicit
+            // [] is an intentional remove-all — then the parent price +
+            // service_time become required again (required_without).
+            const currentSubs: any[] = Array.isArray(current.sub_services)
+              ? current.sub_services
+              : [];
+            const subRows =
+              input.sub_services !== undefined
+                ? input.sub_services
+                : currentSubs;
+            const hasVariants = Array.isArray(subRows) && subRows.length > 0;
+            if (
+              !hasVariants &&
+              currentSubs.length > 0 &&
+              (input.price ?? current.price) == null
+            ) {
+              throw new Error(
+                'Removing ALL variants makes the parent price/service_time required again — pass `price` and `service_time` along with the empty `sub_services` array.',
+              );
+            }
             const payload: Record<string, any> = {
               name_ar:
                 input.name_ar ?? current.name_ar ?? current.name ?? '',
@@ -1034,17 +1386,23 @@ export function buildTools(api: VendorClient): ToolDef[] {
                 current.description_ar ??
                 current.description ??
                 '-',
-              price: input.price ?? current.price,
-              service_time:
-                input.service_time ?? current.service_time ?? 30,
               section_id:
                 input.section_id ?? current.section?.id ?? current.section_id,
               branch_id: branches,
             };
-            if (input.extra_time !== undefined)
-              payload.extra_time = input.extra_time;
-            else if (typeof current.extra_time === 'number')
-              payload.extra_time = current.extra_time;
+            if (hasVariants) {
+              // Variants carry the pricing — the backend nulls the parent
+              // price/service_time/extra_time anyway, so don't send them.
+              payload.sub_services = toSubServiceWire(subRows);
+            } else {
+              payload.price = input.price ?? current.price;
+              payload.service_time =
+                input.service_time ?? current.service_time ?? 30;
+              if (input.extra_time !== undefined)
+                payload.extra_time = input.extra_time;
+              else if (typeof current.extra_time === 'number')
+                payload.extra_time = current.extra_time;
+            }
             const featuredVal = input.featured ?? current.featured;
             if (featuredVal !== undefined && featuredVal !== null) {
               payload.featured =
@@ -1093,6 +1451,17 @@ export function buildTools(api: VendorClient): ToolDef[] {
           case 'update_price': {
             require(input, ['id', 'price'], 'update_price');
             const current = await api.get(`/services/${input.id}`);
+            // A variant service has no parent price — the money lives on
+            // the sub_service rows. Bouncing here (instead of silently
+            // no-oping) tells Claude to edit the right thing.
+            if (
+              Array.isArray(current.sub_services) &&
+              current.sub_services.length > 0
+            ) {
+              throw new Error(
+                `Service ${input.id} has variants (sub_services) — its parent price is unused. Update the variant's own price via action="update" with the full \`sub_services\` array (keep every row's id).`,
+              );
+            }
             const branchIds: any[] = Array.isArray(current.branches)
               ? current.branches.map((b: any) => b.id ?? b)
               : current.branch_id
@@ -1133,7 +1502,7 @@ export function buildTools(api: VendorClient): ToolDef[] {
     {
       name: 'offer',
       description:
-        'Manage promotional offers.\n\nACTIONS:\n• `list` — list offers. Optional: branch_id, per_page.\n• `get` — one offer by id. Required: id.\n• `create` — new offer. Required: name_ar, description_ar, section_id, service_ids (array), branch_id (array), price_type, service_price. Conditional: discount_percentage (when price_type="discount"), offer_price (when price_type="special"). Optional home-delivery fields: is_home_service, home_service_fee, home_only, home_hours.\n• `update` — update one. Required: id. All other fields optional.\n• `activate` / `deactivate` — toggle is_active. Required: id.\n\nPRICE-TYPE SEMANTICS:\n• `service` → offer_price = service_price, discount = 0 (no discount; the offer is just bundling).\n• `free` → offer_price = 0, discount = 100 (100% off).\n• `discount` → caller provides discount_percentage; offer_price auto-computed.\n• `special` → caller provides offer_price; discount_percentage auto-computed.\n\nHOME DELIVERY (May/June-2026): offers can be flagged for home delivery just like services.\n• `is_home_service: true` marks the offer available at the customer\'s home. Toggling it OFF WIPES existing home_hours server-side AND force-resets home_only to 0.\n• `home_service_fee` — optional surcharge layered on top of the offer price.\n• `home_hours: [{day, start_time, end_time}, ...]` — per-weekday windows. Pass them for a mixed in-shop+home offer; a cloud-branch offer carries none (home availability follows the branch official_hours).\n• `home_only: true` — deliver ONLY at home and hide the offer from the in-shop storefront sections. Composes with is_home_service and is ignored (force-reset to 0) unless is_home_service=true.\n\nArabic-only. CONFIRM the pricing math with the vendor before write actions.',
+        'Manage promotional offers.\n\nACTIONS:\n• `list` — list offers. Optional: branch_id, per_page.\n• `get` — one offer by id. Required: id. Includes `services` (each with its `sub_services`) + `service_pins` ({service_id: pinned sub_service_id or null}).\n• `create` — new offer. Required: name_ar, description_ar, section_id, service_ids (array), branch_id (array), price_type, service_price. Conditional: discount_percentage (when price_type="discount"), offer_price (when price_type="special"). Optional: sub_service_ids (variant pins — see below), home-delivery fields (is_home_service, home_service_fee, home_only, home_hours).\n• `update` — update one. Required: id. All other fields optional — current values (INCLUDING variant pins) echoed when omitted.\n• `activate` / `deactivate` — toggle is_active. Required: id.\n\nVARIANT PINS (June-2026): when a constituent service has variants, the offer PINS one variant per service via `sub_service_ids` ({"<service_id>": <sub_service_id>}) — that pin decides the offer\'s duration math and what the customer gets. This tool auto-echoes the stored pins on update so an unrelated edit never unpins a variant. A pinned variant can\'t be deleted from its service until it\'s detached here.\n\nPRICE-TYPE SEMANTICS:\n• `service` → offer_price = service_price, discount = 0 (no discount; the offer is just bundling).\n• `free` → offer_price = 0, discount = 100 (100% off).\n• `discount` → caller provides discount_percentage; offer_price auto-computed.\n• `special` → caller provides offer_price; discount_percentage auto-computed.\n\nHOME DELIVERY (May/June-2026): offers can be flagged for home delivery just like services.\n• `is_home_service: true` marks the offer available at the customer\'s home. Toggling it OFF WIPES existing home_hours server-side AND force-resets home_only to 0.\n• `home_service_fee` — optional surcharge layered on top of the offer price.\n• `home_hours: [{day, start_time, end_time}, ...]` — per-weekday windows. Pass them for a mixed in-shop+home offer; a cloud-branch offer carries none (home availability follows the branch official_hours).\n• `home_only: true` — deliver ONLY at home and hide the offer from the in-shop storefront sections. Composes with is_home_service and is ignored (force-reset to 0) unless is_home_service=true.\n\nArabic-only. CONFIRM the pricing math with the vendor before write actions.',
       inputSchema: z.object({
         action: z.enum([
           'list',
@@ -1150,6 +1519,11 @@ export function buildTools(api: VendorClient): ToolDef[] {
         description_ar: z.string().min(2).optional(),
         section_id: idLike.optional(),
         service_ids: z.array(idLike).min(1).optional(),
+        sub_service_ids: idKeyedMap
+          .optional()
+          .describe(
+            'Variant pin per constituent service: { "<service_id>": <sub_service_id> }. Only for services that have variants.',
+          ),
         price_type: z.enum(['service', 'free', 'discount', 'special']).optional(),
         service_price: z.number().nonnegative().optional(),
         discount_percentage: z.number().min(0).max(100).optional(),
@@ -1258,6 +1632,14 @@ export function buildTools(api: VendorClient): ToolDef[] {
               discount_percentage,
               offer_price,
             };
+            // Variant pins ({service_id: sub_service_id}) — the backend
+            // validates each pin belongs to its service and stores it on
+            // the offer_services pivot.
+            if (
+              input.sub_service_ids &&
+              Object.keys(input.sub_service_ids).length > 0
+            )
+              payload.sub_service_ids = input.sub_service_ids;
             if (input.sort !== undefined) payload.sort = input.sort;
             // Home-service opt-in. Mirrors the service umbrella —
             // when the toggle is on, attach the fee + home_hours;
@@ -1327,6 +1709,24 @@ export function buildTools(api: VendorClient): ToolDef[] {
               offer_price,
             };
             if (input.sort !== undefined) payload.sort = input.sort;
+            // PIN ECHO (load-bearing): the backend re-syncs the
+            // offer_services pivot from the request's sub_service_ids on
+            // every update that carries service_id — which this handler
+            // always echoes. Omitted pins would therefore reset to NULL
+            // and un-pin every variant. Re-send the stored pins from the
+            // detail's `service_pins` map; an explicit input wins.
+            const pinSource: Record<string, any> =
+              input.sub_service_ids ??
+              (current.service_pins && typeof current.service_pins === 'object'
+                ? current.service_pins
+                : {});
+            const pins: Record<string, any> = {};
+            for (const [sid, sub] of Object.entries(pinSource)) {
+              if (sub !== null && sub !== undefined && sub !== '')
+                pins[sid] = sub;
+            }
+            if (Object.keys(pins).length > 0)
+              payload.sub_service_ids = pins;
             // Home-service round-trip. The Offer model casts
             // is_home_service to boolean, so `current.is_home_service`
             // arrives as a real bool — `Boolean(...)` handles both
@@ -1384,7 +1784,7 @@ export function buildTools(api: VendorClient): ToolDef[] {
     {
       name: 'employee',
       description:
-        'Manage employees (staff who take bookings).\n\nACTIONS:\n• `list` — list employees. Optional: branch_id, q, per_page.\n• `get` — one employee by id. Required: id.\n• `create` — new employee. Required: first_name, phone, email, branch_id, role_id (from `role action="list"`), official_hours (array of `{day, start_time, end_time}`). Optional: last_name, password (default "12345678"), service_ids, break_hours, bio (May-2026, single multilingual blurb 2-1000 chars), job_title, salary, commission_type (`none`/`fixed`/`percentage`), commission, commission_calculation_method (`gross`/`net`), start_date, end_date (YYYY-MM-DD).\n• `update` — update one. Required: id. All other fields optional — current values echoed when omitted.\n• `activate` / `deactivate` — toggle is_active (hidden from booking pickers when off). Required: id.\n\nThis creates a real user account with login credentials — CONFIRM every field with the vendor.',
+        'Manage employees (staff who take bookings).\n\nACTIONS:\n• `list` — list employees. Optional: branch_id, q, per_page.\n• `get` — one employee by id. Required: id.\n• `create` — new employee. Required: first_name, phone, email, branch_id, role_id (from `role action="list"`), official_hours (array of `{day, start_time, end_time}`). Optional: last_name, password (default "12345678"), service_ids, break_hours, bio (May-2026, single multilingual blurb 2-1000 chars), job_title, salary, commission_type (`none`/`fixed`/`percentage`), commission, commission_calculation_method (`gross`/`net`), start_date, end_date (YYYY-MM-DD). If the vendor has Google Calendar connected (see `google_calendar`), the new employee automatically gets their own mapped calendar.\n• `update` — update one. Required: id. All other fields optional — current values echoed when omitted.\n• `activate` / `deactivate` — toggle is_active (hidden from booking pickers when off). Required: id.\n\nThis creates a real user account with login credentials — CONFIRM every field with the vendor.',
       inputSchema: z.object({
         action: z.enum([
           'list',
@@ -1957,16 +2357,42 @@ export function buildTools(api: VendorClient): ToolDef[] {
     {
       name: 'reminder',
       description:
-        'Manage booking reminders (when to remind customers before their booking — e.g. 24h before, 1h before).\n\nACTIONS:\n• `list` — list reminders.\n• `get` — one by id. Required: id.\n• `update` — update one. Required: id. Optional: minutes_before, channels (array of reminder-channel ids).\n• `activate` / `deactivate` — toggle. Required: id.',
+        'Manage the vendor\'s notification templates. TWO TYPES share this resource:\n• type=`reminder` — pre-booking reminders sent `duration` minutes before the appointment (allowed values: 30 / 60 / 120 / 180).\n• type=`alert` — event-driven notifications (booking created / canceled / etc.); no duration.\n\nACTIONS:\n• `list` — list all templates (both types).\n• `get` — one by id. Required: id.\n• `update` — edit a template. Required: id. Optional: content (the default message, ≥2 chars), content_push / content_sms / content_whatsapp / content_email (per-channel overrides — blank means "reuse content"), email_enabled / sms_enabled / whatsapp_enabled / push_enabled (per-template channel toggles), duration (reminders only: 30/60/120/180). Current values are echoed for everything omitted, so a one-field edit is safe.\n• `reset_defaults` — restore ALL the vendor\'s templates to the platform defaults (content + per-channel texts + channel flags + duration) and re-activate them. No params. CONFIRM first — this overwrites every custom wording.\n• `activate` / `deactivate` — toggle one template. Required: id.\n\nNote: a channel disabled at the PLATFORM level (see `reminder_channels` → `platform`) stays off regardless of the per-template flags.',
       inputSchema: z.object({
-        action: z.enum(['list', 'get', 'update', 'activate', 'deactivate']),
+        action: z.enum([
+          'list',
+          'get',
+          'update',
+          'reset_defaults',
+          'activate',
+          'deactivate',
+        ]),
         id: idLike.optional(),
         page: z.number().int().min(1).optional(),
         per_page: z.number().int().min(1).max(100).optional(),
-        minutes_before: z.number().int().min(0).optional(),
-        channels: z.array(idLike).optional(),
+        content: z.string().min(2).optional(),
+        content_push: z.string().optional(),
+        content_sms: z.string().optional(),
+        content_whatsapp: z.string().optional(),
+        content_email: z.string().optional(),
+        email_enabled: z.boolean().optional(),
+        sms_enabled: z.boolean().optional(),
+        whatsapp_enabled: z.boolean().optional(),
+        push_enabled: z.boolean().optional(),
+        duration: z
+          .union([
+            z.literal(30),
+            z.literal(60),
+            z.literal(120),
+            z.literal(180),
+          ])
+          .optional()
+          .describe('Reminders only: minutes before the booking (30/60/120/180).'),
       }),
       handler: async (input) => {
+        // Backend reads 0/1/'0'/'1'/bool — normalise whatever the detail
+        // echoes back into the '0'/'1' strings the validator wants.
+        const flag01 = (v: any): '0' | '1' => (Number(v) ? '1' : '0');
         switch (input.action) {
           case 'list':
             return api.getRaw(
@@ -1978,14 +2404,54 @@ export function buildTools(api: VendorClient): ToolDef[] {
             return api.get(`/reminders/${input.id}`);
           case 'update': {
             require(input, ['id'], 'update');
-            const payload: Record<string, any> = {};
-            if (input.minutes_before !== undefined)
-              payload.minutes_before = input.minutes_before;
-            if (input.channels) payload.channels = input.channels;
+            // ReminderRequest requires content + ALL FOUR channel flags
+            // on every update (+ duration when type=reminder) — echo the
+            // stored values for whatever the caller didn't change.
+            const current = await api.get(`/reminders/${input.id}`);
+            const payload: Record<string, any> = {
+              content: input.content ?? current.content ?? '',
+              email_enabled:
+                input.email_enabled !== undefined
+                  ? bool01(input.email_enabled)
+                  : flag01(current.email_enabled),
+              sms_enabled:
+                input.sms_enabled !== undefined
+                  ? bool01(input.sms_enabled)
+                  : flag01(current.sms_enabled),
+              whatsapp_enabled:
+                input.whatsapp_enabled !== undefined
+                  ? bool01(input.whatsapp_enabled)
+                  : flag01(current.whatsapp_enabled),
+              push_enabled:
+                input.push_enabled !== undefined
+                  ? bool01(input.push_enabled)
+                  : flag01(current.push_enabled),
+            };
+            // Per-channel overrides — nullable; blank means "reuse the
+            // default content". Echo stored values when omitted so an
+            // unrelated edit doesn't blank a tailored channel text.
+            for (const k of [
+              'content_push',
+              'content_sms',
+              'content_whatsapp',
+              'content_email',
+            ] as const) {
+              const v = input[k] ?? current[k];
+              if (v !== undefined && v !== null && v !== '') payload[k] = v;
+            }
+            // duration is required only for type=reminder; alerts carry
+            // none. Echo the stored value when present.
+            const duration = input.duration ?? current.duration;
+            if (duration !== undefined && duration !== null)
+              payload.duration = duration;
             return api.putViaPost(`/reminders/${input.id}`, payload, {
               multipart: true,
             });
           }
+          case 'reset_defaults':
+            // Copies every template's content/channel texts/flags/duration
+            // back from its admin template and re-activates it.
+            return api.post('/reminders/reset-defaults');
           case 'activate':
           case 'deactivate':
             require(input, ['id'], input.action);
@@ -2001,24 +2467,40 @@ export function buildTools(api: VendorClient): ToolDef[] {
     {
       name: 'reminder_channels',
       description:
-        'Manage which delivery channels (SMS / Email / Push / WhatsApp) are enabled for booking reminders.\n\nACTIONS:\n• `get` — read the current channel list with their enabled flags.\n• `update` — toggle channels. Required: channels (array of `{id, is_active}`).',
+        'The vendor\'s ACCOUNT-WIDE notification channel switches (email / SMS / WhatsApp / push) — the master toggles that sit above the per-template flags on each `reminder`.\n\nACTIONS:\n• `get` — read the four flags + a `platform` map ({email_enabled..push_enabled: bool}) showing which channels the PLATFORM allows. A platform-locked channel reads as OFF and CANNOT be enabled by the vendor — don\'t offer to flip it; explain it\'s disabled platform-wide (WhatsApp additionally requires the package feature `whatsapp_notifications`).\n• `update` — set the flags. Pass only what changed (email_enabled / sms_enabled / whatsapp_enabled / push_enabled as booleans) — the rest echo their current values. Attempting to enable a platform-locked channel is silently forced back to off by the backend.',
       inputSchema: z.object({
         action: z.enum(['get', 'update']),
-        channels: z
-          .array(z.object({ id: idLike, is_active: z.boolean() }))
-          .min(1)
-          .optional(),
+        email_enabled: z.boolean().optional(),
+        sms_enabled: z.boolean().optional(),
+        whatsapp_enabled: z.boolean().optional(),
+        push_enabled: z.boolean().optional(),
       }),
       handler: async (input) => {
+        const flag01 = (v: any): '0' | '1' => (Number(v) ? '1' : '0');
         switch (input.action) {
           case 'get':
             return api.get('/reminder-channels');
           case 'update': {
-            require(input, ['channels'], 'update');
-            const payload = {
-              channels: (
-                input.channels as Array<{ id: any; is_active: boolean }>
-              ).map((c) => ({ id: c.id, is_active: bool01(c.is_active) })),
+            // ReminderChannelRequest requires ALL FOUR flags as 0/1 —
+            // echo the current values for whatever wasn't passed.
+            const current = await api.get('/reminder-channels');
+            const payload: Record<string, any> = {
+              email_enabled:
+                input.email_enabled !== undefined
+                  ? bool01(input.email_enabled)
+                  : flag01(current?.email_enabled),
+              sms_enabled:
+                input.sms_enabled !== undefined
+                  ? bool01(input.sms_enabled)
+                  : flag01(current?.sms_enabled),
+              whatsapp_enabled:
+                input.whatsapp_enabled !== undefined
+                  ? bool01(input.whatsapp_enabled)
+                  : flag01(current?.whatsapp_enabled),
+              push_enabled:
+                input.push_enabled !== undefined
+                  ? bool01(input.push_enabled)
+                  : flag01(current?.push_enabled),
             };
             return api.putViaPost('/reminder-channels', payload, {
               multipart: true,
@@ -2035,13 +2517,16 @@ export function buildTools(api: VendorClient): ToolDef[] {
     {
       name: 'settings',
       description:
-        'Read/write the vendor\'s storefront settings.\n\nACTIONS:\n• `get` — current settings.\n• `update` — change settings. Optional fields (current values echoed when omitted): booking_differance (minutes of lead time before customers can book, ≥0), calender_differance (calendar resolution, 5-30 min), cancel_booking (whether customers can self-cancel), reviews_enabled (toggle customer review CTA + vendor dashboard), terms (T&C blurb, ≥3 chars).',
+        'Read/write the vendor\'s storefront settings.\n\nACTIONS:\n• `get` — current settings.\n• `update` — change settings. Optional fields (current values echoed when omitted): booking_differance (minutes of lead time before customers can book, ≥0), calender_differance (calendar resolution, 5-30 min), cancel_booking (whether customers can self-cancel), reviews_enabled (toggle customer review CTA + vendor dashboard), terms (T&C blurb, ≥3 chars).\n\nGOOGLE REVIEWS SETTINGS (June-2026, complement the per-branch link on the `branch` tool):\n• `google_reviews_min_stars` (1-5) — storefront display threshold: only Google reviews with at least this many stars show on the customer branch page.\n• `google_review_boost_enabled` — rating boost: after a good visit, invite the customer to leave a Google review.\n• `google_review_boost_min_stars` (1-5) — only invite customers whose in-app rating was at least this.',
       inputSchema: z.object({
         action: z.enum(['get', 'update']),
         booking_differance: z.number().int().min(0).optional(),
         calender_differance: z.number().int().min(5).max(30).optional(),
         cancel_booking: z.boolean().optional(),
         reviews_enabled: z.boolean().optional(),
+        google_reviews_min_stars: z.number().int().min(1).max(5).optional(),
+        google_review_boost_enabled: z.boolean().optional(),
+        google_review_boost_min_stars: z.number().int().min(1).max(5).optional(),
         terms: z.string().min(3).optional(),
       }),
       handler: async (input) => {
@@ -2064,10 +2549,205 @@ export function buildTools(api: VendorClient): ToolDef[] {
               payload.reviews_enabled = bool01(input.reviews_enabled);
             else if (current.reviews_enabled !== undefined)
               payload.reviews_enabled = current.reviews_enabled;
+            // Google-reviews settings are `sometimes` rules — omitted
+            // keys keep their stored value server-side, so pass only
+            // what the caller actually set (no echo needed).
+            if (input.google_reviews_min_stars !== undefined)
+              payload.google_reviews_min_stars = input.google_reviews_min_stars;
+            if (input.google_review_boost_enabled !== undefined)
+              payload.google_review_boost_enabled = bool01(
+                input.google_review_boost_enabled,
+              );
+            if (input.google_review_boost_min_stars !== undefined)
+              payload.google_review_boost_min_stars =
+                input.google_review_boost_min_stars;
             if (input.terms) payload.terms = input.terms;
             else if (current.terms) payload.terms = current.terms;
             return api.putViaPost('/settings', payload, { multipart: true });
           }
+        }
+      },
+    },
+
+    // ════════════════════════════════════════════════════════════════
+    //  UMBRELLA — google_calendar (June-2026 two-way sync)
+    // ════════════════════════════════════════════════════════════════
+
+    {
+      name: 'google_calendar',
+      description:
+        'Two-way Google Calendar sync (June-2026, package feature `google_calendar`). Streamline bookings push to the employee\'s mapped Google calendar, and externally-busy times block Streamline slots (see `external_busy` on get_calendar + the create-time conflict guard on `booking`).\n\nACTIONS:\n• `status` — connection state: configured (server has credentials), connected, email, sync_enabled, default_calendar_id, calendars[] (the Google account\'s calendar list), employees[] (each with their mapped google_calendar_id or null).\n• `connect` — start the OAuth flow. Returns a `url` the VENDOR must open in a browser to grant access (you cannot complete OAuth for them — send them the link). On a fresh connection the backend auto-creates one dedicated calendar per employee ("{name} - Streamline") and maps them.\n• `disconnect` — drop the connection + clear every employee mapping. CONFIRM first.\n• `update_settings` — Optional: sync_enabled (bool), default_calendar_id (string, "" to clear), mappings ({employee_id: calendar_id or "" to unmap}).\n• `create_calendar` — create a new calendar in the vendor\'s Google account. Required: name (1-120 chars). Returns {id, summary} — map it to an employee via update_settings.\n• `reschedule_event` — move an EXTERNAL Google event (one from get_calendar\'s external_busy, NOT a Streamline booking) to a new time. Required: calendar_id, event_id, start_time + end_time ("YYYY-MM-DD HH:MM:SS" Saudi-local). Optional: employee_id (moves the event to that employee\'s calendar first).\n\nA 403 "هذه الميزة غير متاحة في باقتك الحالية" means the plan lacks the google_calendar feature. A 400 "لم يتم ربط تقويم Google بعد" means run `connect` first.',
+      inputSchema: z.object({
+        action: z.enum([
+          'status',
+          'connect',
+          'disconnect',
+          'update_settings',
+          'create_calendar',
+          'reschedule_event',
+        ]),
+        return_url: z
+          .string()
+          .optional()
+          .describe('connect: where Google should bounce the vendor back to (defaults to the dashboard).'),
+        sync_enabled: z.boolean().optional(),
+        default_calendar_id: z.string().max(255).optional(),
+        mappings: idKeyedMap
+          .optional()
+          .describe(
+            'update_settings: { "<employee_id>": "<google_calendar_id>" }. Empty string unmaps the employee.',
+          ),
+        name: z.string().min(1).max(120).optional(),
+        calendar_id: z.string().max(255).optional(),
+        event_id: z.string().max(255).optional(),
+        employee_id: idLike.optional(),
+        start_time: z
+          .string()
+          .regex(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2})?$/)
+          .optional(),
+        end_time: z
+          .string()
+          .regex(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2})?$/)
+          .optional(),
+      }),
+      handler: async (input) => {
+        // The backend validates H:i:s — pad a missing seconds part so
+        // Claude can pass the same HH:MM shape it uses everywhere else.
+        const toHms = (v: string) =>
+          /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(v) ? `${v}:00` : v;
+        switch (input.action) {
+          case 'status':
+            return api.get('/google-calendar');
+          case 'connect':
+            return api.get(
+              '/google-calendar/connect',
+              clean({ return_url: input.return_url }),
+            );
+          case 'disconnect':
+            return api.post('/google-calendar/disconnect');
+          case 'update_settings': {
+            const payload: Record<string, any> = {};
+            if (input.sync_enabled !== undefined)
+              payload.sync_enabled = bool01(input.sync_enabled);
+            if (input.default_calendar_id !== undefined)
+              payload.default_calendar_id = input.default_calendar_id;
+            if (input.mappings && Object.keys(input.mappings).length > 0)
+              payload.mappings = input.mappings;
+            if (Object.keys(payload).length === 0) {
+              throw new Error(
+                'action="update_settings" needs at least one of: sync_enabled, default_calendar_id, mappings.',
+              );
+            }
+            // PUT route — hidden-method over multipart so Laravel's
+            // method override (form-data only, not JSON) picks it up.
+            return api.putViaPost('/google-calendar/settings', payload, {
+              multipart: true,
+            });
+          }
+          case 'create_calendar':
+            require(input, ['name'], 'create_calendar');
+            return api.post(
+              '/google-calendar/calendar',
+              { name: input.name },
+              { multipart: true },
+            );
+          case 'reschedule_event':
+            require(
+              input,
+              ['calendar_id', 'event_id', 'start_time', 'end_time'],
+              'reschedule_event',
+            );
+            return api.putViaPost(
+              '/google-calendar/event',
+              clean({
+                calendar_id: input.calendar_id,
+                event_id: input.event_id,
+                employee_id: input.employee_id,
+                start_time: toHms(input.start_time!),
+                end_time: toHms(input.end_time!),
+              }),
+              { multipart: true },
+            );
+        }
+      },
+    },
+
+    // ════════════════════════════════════════════════════════════════
+    //  UMBRELLA — subscription (packages + billing, June-2026)
+    // ════════════════════════════════════════════════════════════════
+
+    {
+      name: 'subscription',
+      description:
+        'The vendor\'s plan + billing ("اشتراكي").\n\nACTIONS:\n• `packages` — the active public packages the vendor can subscribe/upgrade to (each with limits + `features` flags). Use when a feature-gate 403 suggests an upgrade.\n• `list` — the vendor\'s subscription history. • `get` — one subscription (with its package). Required: id.\n• `create` — start a subscription on a package. Required: package_id, auto_renew (bool). Returns the new subscription row (status pending until paid/activated).\n• `pay` — get the payment-gateway URL for a pending subscription. Required: subscription_id. Send the vendor the returned URL to complete payment in the browser — you cannot pay for them.\n• `check_is_paid` — poll whether the gateway payment went through. Required: subscription_id.\n• `activate_free` — activate a FREE (price 0) plan directly, no gateway. Required: subscription_id. The backend rejects any priced plan here ("هذه الباقة تتطلب عملية دفع") and only the vendor\'s own subscription is accepted.\n\nBILLING IS SENSITIVE: before create/pay/activate_free, spell out the package name, price, period and limits and get an explicit نعم. Flow for a free plan: packages → create(package_id) → activate_free(subscription_id). Flow for a paid plan: packages → create → pay → vendor pays in browser → check_is_paid.',
+      inputSchema: z.object({
+        action: z.enum([
+          'packages',
+          'list',
+          'get',
+          'create',
+          'pay',
+          'check_is_paid',
+          'activate_free',
+        ]),
+        id: idLike.optional(),
+        page: z.number().int().min(1).optional(),
+        per_page: z.number().int().min(1).max(100).optional(),
+        package_id: idLike.optional(),
+        auto_renew: z.boolean().optional(),
+        subscription_id: idLike.optional(),
+      }),
+      handler: async (input) => {
+        switch (input.action) {
+          case 'packages':
+            return api.getRaw(
+              '/packages',
+              clean({ page: input.page, per_page: input.per_page }),
+            );
+          case 'list':
+            return api.getRaw(
+              '/subscriptions',
+              clean({ page: input.page, per_page: input.per_page }),
+            );
+          case 'get':
+            require(input, ['id'], 'get');
+            return api.get(`/subscriptions/${input.id}`);
+          case 'create':
+            require(input, ['package_id'], 'create');
+            if (input.auto_renew === undefined) {
+              throw new Error(
+                'action="create" requires `auto_renew` (true/false) — ask the vendor whether the plan should renew automatically.',
+              );
+            }
+            return api.post(
+              '/subscriptions',
+              {
+                package_id: input.package_id,
+                auto_renew: bool01(input.auto_renew),
+              },
+              { multipart: true },
+            );
+          case 'pay':
+            require(input, ['subscription_id'], 'pay');
+            return api.post(
+              '/subscriptions/pay',
+              { subscription_id: input.subscription_id },
+              { multipart: true },
+            );
+          case 'check_is_paid':
+            require(input, ['subscription_id'], 'check_is_paid');
+            return api.post(
+              '/subscriptions/check_is_paid',
+              { subscription_id: input.subscription_id },
+              { multipart: true },
+            );
+          case 'activate_free':
+            require(input, ['subscription_id'], 'activate_free');
+            return api.post(
+              '/subscriptions/activate-free',
+              { subscription_id: input.subscription_id },
+              { multipart: true },
+            );
         }
       },
     },

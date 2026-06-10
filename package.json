@@ -1,6 +1,6 @@
 {
   "name": "streamline-mcp",
-  "version": "0.6.2",
+  "version": "0.7.0",
   "private": true,
   "description": "MCP server that lets Claude read and edit a Streamline vendor account through the same /vendor/v1 API the mobile app uses. Ships in two flavours: stdio (Claude Desktop, single-vendor) and HTTP+OAuth (claude.ai custom connector, multi-vendor).",
   "type": "module",
