@@ -26,7 +26,6 @@
  * users running this MCP may be anywhere in the world).
  */
 
-const SAUDI_OFFSET = '+03:00';
 const SAUDI_TZ = 'Asia/Riyadh';
 
 /**
@@ -45,7 +44,12 @@ export function saudiLocalToUnix(date: string, time: string): number {
   // Normalise "9:00" → "09:00" so the ISO parser is happy.
   const [hRaw, m] = time.split(':');
   const h = hRaw.padStart(2, '0');
-  const iso = `${date}T${h}:${m}:00${SAUDI_OFFSET}`;
+  // Wall-as-UTC wire convention (June-2026): `booking_timestamp` encodes
+  // the vendor's WALL CLOCK as UTC seconds — the backend pins
+  // `createFromTimestamp($ts, 'UTC')` and reproduces the exact wall time.
+  // Parsing with `+03:00` here produced a TRUE epoch (wall − 3h), which
+  // the pinned backend stored 3 hours early ("16:00 طلب، 13:00 انخزن").
+  const iso = `${date}T${h}:${m}:00Z`;
   const ms = Date.parse(iso);
   if (Number.isNaN(ms)) {
     throw new Error(`Could not parse "${date} ${time}" as a Saudi local datetime.`);
