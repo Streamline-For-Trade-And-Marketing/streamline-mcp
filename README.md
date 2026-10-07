@@ -105,7 +105,9 @@ Once DNS is ready (see Cloudflare instructions):
 4. Persistent volume: mount `/app/data` so SQLite survives restarts.
 5. Env vars:
    - `MCP_PUBLIC_URL=https://mcp.streamline.com.sa`
-   - `STREAMLINE_API_BASE=https://api.streamline.com.sa` (default)
+   - `STREAMLINE_API_BASE=https://api.streamline.com.sa` (default; the tools use the same host)
+   - `STREAMLINE_WEB_URL=https://streamline.com.sa` (links for sign-up / forgot password)
+   - Optional quick sign-in, same ids as the website's partner login: `GOOGLE_CLIENT_ID` (web OAuth client), `APPLE_CLIENT_ID` (Services ID), `APPLE_REDIRECT_URI` (defaults to `<origin>/oauth/authorize`). Each button shows only when its id is set. Before enabling: add `https://mcp.streamline.com.sa` to the Google client's authorized JavaScript origins, and the domain + return URL to the Apple Services ID.
 6. Deploy. Health check `GET /health` should turn green.
 
 ---

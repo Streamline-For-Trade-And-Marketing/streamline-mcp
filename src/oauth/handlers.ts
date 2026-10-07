@@ -40,10 +40,11 @@
 import type { Request, Response } from 'express';
 import { createHash, randomBytes } from 'node:crypto';
 import { OauthStore } from './store.js';
-import { renderLoginPage } from './login-page.js';
+import { partnerSignupUrl, renderLoginPage } from './login-page.js';
 import {
   loginToStreamline,
   loginToStreamlineWithCode,
+  loginToStreamlineWithSocial,
   sendStreamlineLoginCode,
   StreamlineAuthError,
   type StreamlineLoginResult,
@@ -277,6 +278,31 @@ export function makeOauthHandlers(store: OauthStore) {
         if (session.state) url.searchParams.set('state', session.state);
         res.redirect(302, url.toString());
       };
+
+      if (step === 'social') {
+        try {
+          const outcome = await loginToStreamlineWithSocial({
+            provider: String(req.body?.provider || ''),
+            id_token: String(req.body?.id_token || ''),
+            first_name: typeof req.body?.first_name === 'string' ? req.body.first_name : undefined,
+            last_name: typeof req.body?.last_name === 'string' ? req.body.last_name : undefined,
+          });
+          if (outcome.kind === 'session') {
+            finish(outcome.result);
+          } else if (outcome.kind === 'confirm_email') {
+            page(409, { mode: 'code', username: outcome.email, info: outcome.message });
+          } else if (outcome.kind === 'needs_business') {
+            page(404, { info: outcome.message, info_link: { href: partnerSignupUrl, label: 'إنشاء حساب شريك' } });
+          } else {
+            page(409, { info: outcome.message });
+          }
+        } catch (err) {
+          page(err instanceof StreamlineAuthError ? err.status : 502, {
+            error: err instanceof StreamlineAuthError ? err.message : 'تعذّر الاتصال بـ Streamline. حاول مرة ثانية بعد قليل.',
+          });
+        }
+        return;
+      }
 
       const viaCode = step === 'verify_code';
       try {

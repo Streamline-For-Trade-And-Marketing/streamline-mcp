@@ -75,8 +75,9 @@ export async function sendStreamlineLoginCode(
 
 export async function loginToStreamlineWithCode(
   email: string,
-  code: string,
+  rawCode: string,
 ): Promise<StreamlineLoginResult> {
+  const code = rawCode.replace(/[٠-٩۰-۹]/g, (d) => String(d.charCodeAt(0) & 0xf)).trim();
   if (!email || !/^\d{6}$/.test(code)) {
     throw new StreamlineAuthError('أدخل الرمز المكوّن من ٦ أرقام.', 400);
   }
@@ -84,6 +85,42 @@ export async function loginToStreamlineWithCode(
   fd.append('email', email.trim().toLowerCase());
   fd.append('code', code);
   return sessionFrom(await postToStreamline('/vendor/v1/login/code', fd), 'الرمز غير صحيح.');
+}
+
+export type SocialOutcome =
+  | { kind: 'session'; result: StreamlineLoginResult }
+  | { kind: 'needs_business'; message: string }
+  | { kind: 'confirm_email'; email: string; message: string }
+  | { kind: 'invitation'; message: string };
+
+/** Google / Apple sign-in through the same endpoint as the partner login page. */
+export async function loginToStreamlineWithSocial(payload: {
+  provider: string;
+  id_token: string;
+  first_name?: string;
+  last_name?: string;
+}): Promise<SocialOutcome> {
+  if (!['google', 'apple'].includes(payload.provider) || !payload.id_token) {
+    throw new StreamlineAuthError('تعذّر تسجيل الدخول، حاول مرة ثانية.', 400);
+  }
+  const fd = new FormData();
+  fd.append('provider', payload.provider);
+  fd.append('id_token', payload.id_token);
+  if (payload.first_name) fd.append('first_name', payload.first_name.slice(0, 50));
+  if (payload.last_name) fd.append('last_name', payload.last_name.slice(0, 50));
+  const res = await postToStreamline('/vendor/v1/auth/social', fd);
+  const body = res.data;
+  const code = body?.errors?.code;
+  if (res.status === 409 && code === 'confirm_email_first') {
+    return { kind: 'confirm_email', email: String(body.errors.email || ''), message: body.message || '' };
+  }
+  if (res.status === 409 && code === 'invitation_pending') {
+    return { kind: 'invitation', message: body.message || '' };
+  }
+  if (res.status === 200 && body?.data?.needs_business) {
+    return { kind: 'needs_business', message: 'ما لقينا حساب شريك مربوط بهذا الحساب.' };
+  }
+  return { kind: 'session', result: sessionFrom(res, 'تعذّر تسجيل الدخول، حاول مرة ثانية.') };
 }
 
 async function postToStreamline(path: string, fd: FormData) {
