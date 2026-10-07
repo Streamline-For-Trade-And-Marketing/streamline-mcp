@@ -268,7 +268,7 @@ export function buildTools(api: VendorClient): ToolDef[] {
     {
       name: 'ai_memory',
       description:
-        'Streamline AI memory: the owner\'s standing preferences (numbered, max 10) that every Streamline AI suggestion follows. action: list (shop summary + preferences) · remember (note = a lasting preference the owner states, in their words, max 100 chars; replaces = the number of the preference it updates or contradicts) · forget (number). Save only what the owner wants kept for the future, never one-off requests.',
+        'Streamline AI memory: the owner\'s standing preferences (numbered, max 10) that every Streamline AI suggestion follows. action: list (shop summary + preferences) · remember (note = a lasting preference the owner states, in their words, max 100 chars; replaces = the number of the preference on the same subject it changes) · forget (number). Numbers change after every change: use the latest list. Save only what the owner wants kept for the future, never one-off requests.',
       inputSchema: z.object({
         action: z.enum(['list', 'remember', 'forget']),
         note: z.string().min(2).max(100).optional(),

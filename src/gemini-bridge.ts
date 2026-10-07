@@ -70,16 +70,17 @@ export interface GeminiChatResult {
 export const BUSY_MESSAGE =
   'الخدمة مشغولة حاليًا 🙏 كل النماذج المجانية وصلت حدّها المؤقت. جرّب بعد دقيقة.';
 
-// Failed models rest: busy → a minute (or Google's retryDelay), hung → 5 min,
+// Failed models rest: busy → a minute (or Google's retryDelay), hung → 3 min,
 // daily quota spent → until the Pacific-midnight reset, retired → a day.
 const cooldownUntil = new Map<string, number>();
 const COOLDOWN_MS = 60_000;
-const HUNG_COOLDOWN_MS = 5 * 60_000;
+const HUNG_COOLDOWN_MS = 3 * 60_000;
 const GONE_COOLDOWN_MS = 24 * 60 * 60_000;
-const CALL_TIMEOUT_MS = 15_000;
+const CALL_TIMEOUT_MS = 20_000;
+const noThinking = new Set<string>();
 // Tool chats need a little planning: low thinking keeps them agentic without the slow default.
 function thinkingFor(model: string): Record<string, unknown> {
-  if (model.startsWith('gemma')) return {};
+  if (model.startsWith('gemma') || noThinking.has(model)) return {};
   if (model.startsWith('gemini-2.5')) return { thinkingConfig: { thinkingBudget: 512 } };
   return { thinkingConfig: { thinkingLevel: 'low' } };
 }
@@ -93,8 +94,9 @@ function msUntilQuotaReset(): number {
 
 function cooldownFor(err: any): number {
   const status = err?.response?.status;
-  const details: any[] = err?.response?.data?.error?.details || [];
-  if (details.some((d) => (d?.violations || []).some((v: any) => /PerDay/.test(String(v?.quotaId || ''))))) {
+  const raw = err?.response?.data?.error?.details;
+  const details: any[] = Array.isArray(raw) ? raw : [];
+  if (details.some((d) => Array.isArray(d?.violations) && d.violations.some((v: any) => /PerDay/.test(String(v?.quotaId || ''))))) {
     return msUntilQuotaReset();
   }
   const retry = parseFloat(String(details.find((d) => String(d?.['@type'] || '').endsWith('RetryInfo'))?.retryDelay || ''));
@@ -133,6 +135,11 @@ async function callGemini(
       lastErr = err;
       const status = err?.response?.status;
       const detail = err?.response?.data?.error?.message || err?.message || '';
+      if (status === 400 && /thinking/i.test(String(detail)) && !noThinking.has(model)) {
+        noThinking.add(model);
+        i--;
+        continue;
+      }
       const rest = cooldownFor(err);
       if (rest > 0) cooldownUntil.set(model, Date.now() + rest);
       // eslint-disable-next-line no-console

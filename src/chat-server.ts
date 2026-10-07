@@ -215,13 +215,15 @@ type Turn = { context: string; usage?: Usage; memory?: Memory | null } | { statu
 // The backend gates the assistant (package feature + daily/minute limits) and hands back the shop memory.
 async function startTurn(api: VendorClient, lang: string, message?: string): Promise<Turn> {
   try {
-    const data: any = await api.post('/ai/chat-turn', message ? { message } : {}, { headers: { 'Accept-Language': lang } });
+    const data: any = await api.post('/ai/chat-turn', message ? { message } : {}, {
+      headers: { 'Accept-Language': lang },
+      timeoutMs: 30_000,
+    });
     return { context: String(data?.context || ''), usage: data?.usage, memory: data?.memory ?? null };
   } catch (err: any) {
-    if ([401, 403, 429].includes(err?.status)) {
-      return { status: err.status, reply: String(err?.raw?.message || BUSY_REPLY) };
-    }
-    return { context: '' };
+    if (err?.status === 404) return { context: '' };
+    const known = [401, 403, 429].includes(err?.status);
+    return { status: known ? err.status : 503, reply: known ? String(err?.raw?.message || BUSY_REPLY) : BUSY_REPLY };
   }
 }
 
