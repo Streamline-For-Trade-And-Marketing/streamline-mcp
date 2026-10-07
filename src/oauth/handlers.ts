@@ -41,7 +41,13 @@ import type { Request, Response } from 'express';
 import { createHash, randomBytes } from 'node:crypto';
 import { OauthStore } from './store.js';
 import { renderLoginPage } from './login-page.js';
-import { loginToStreamline, StreamlineAuthError } from './streamline-auth.js';
+import {
+  loginToStreamline,
+  loginToStreamlineWithCode,
+  sendStreamlineLoginCode,
+  StreamlineAuthError,
+  type StreamlineLoginResult,
+} from './streamline-auth.js';
 
 /**
  * In-memory map of `request_id → pending authorize parameters`.
@@ -206,7 +212,7 @@ export function makeOauthHandlers(store: OauthStore) {
      * POST /oauth/authorize — handle the login form.
      */
     async authorizePost(req: Request, res: Response): Promise<void> {
-      const { request_id, username, password } = req.body || {};
+      const { request_id, username, password, step, code } = req.body || {};
       const session = typeof request_id === 'string' ? pending.get(request_id) : null;
       if (!session) {
         // eslint-disable-next-line no-console
@@ -224,10 +230,34 @@ export function makeOauthHandlers(store: OauthStore) {
         return;
       }
 
-      try {
-        const result = await loginToStreamline(String(username || ''), String(password || ''));
-        // Mint the auth code with the vendor token stashed alongside it.
-        const code = store.createAuthCode({
+      const email = typeof username === 'string' ? username.trim() : '';
+      const clientName = store.getClient(session.client_id)?.client_name ?? 'Claude';
+      const page = (status: number, opts: Partial<Parameters<typeof renderLoginPage>[0]>) =>
+        res.status(status).type('html').send(renderLoginPage({ request_id, username: email, client_name: clientName, ...opts }));
+
+      if (step === 'code_mode' || step === 'password_mode') {
+        page(200, { mode: step === 'code_mode' ? 'code' : 'password' });
+        return;
+      }
+
+      if (step === 'send_code') {
+        try {
+          const sent = await sendStreamlineLoginCode(email);
+          session.created_at = Date.now();
+          page(200, sent.invitationSent
+            ? { mode: 'code', info: 'أعدنا إرسال دعوة الانضمام إلى بريدك. افتح الرابط وفعّل حسابك ثم ارجع هنا.' }
+            : { mode: 'code', code_sent: true, info: sent.message || 'أرسلنا رمز الدخول إلى بريدك.' });
+        } catch (err) {
+          page(err instanceof StreamlineAuthError ? err.status : 502, {
+            mode: 'code',
+            error: err instanceof StreamlineAuthError ? err.message : 'تعذّر الاتصال بـ Streamline. حاول مرة ثانية بعد قليل.',
+          });
+        }
+        return;
+      }
+
+      const finish = (result: StreamlineLoginResult) => {
+        const authCode = store.createAuthCode({
           client_id: session.client_id,
           redirect_uri: session.redirect_uri,
           code_challenge: session.code_challenge,
@@ -242,11 +272,17 @@ export function makeOauthHandlers(store: OauthStore) {
           `[oauth/authorize:POST] 302 issued code for client=${session.client_id} user="${result.user.email}" type=${result.user.type} → ${session.redirect_uri}`,
         );
 
-        // Redirect back to the OAuth client with the code + state.
         const url = new URL(session.redirect_uri);
-        url.searchParams.set('code', code);
+        url.searchParams.set('code', authCode);
         if (session.state) url.searchParams.set('state', session.state);
         res.redirect(302, url.toString());
+      };
+
+      const viaCode = step === 'verify_code';
+      try {
+        finish(viaCode
+          ? await loginToStreamlineWithCode(email, String(code || '').trim())
+          : await loginToStreamline(email, String(password || '')));
       } catch (err) {
         const errMsg =
           err instanceof StreamlineAuthError
@@ -254,20 +290,11 @@ export function makeOauthHandlers(store: OauthStore) {
             : 'تعذّر الاتصال بـ Streamline. حاول مرة ثانية بعد قليل.';
         // eslint-disable-next-line no-console
         console.error(
-          `[oauth/authorize:POST] ${err instanceof StreamlineAuthError ? err.status : 502} login failed for "${username}" — ${errMsg}`,
+          `[oauth/authorize:POST] ${err instanceof StreamlineAuthError ? err.status : 502} login failed for "${email}" — ${errMsg}`,
         );
-        const client = store.getClient(session.client_id);
-        res
-          .status(err instanceof StreamlineAuthError ? err.status : 502)
-          .type('html')
-          .send(
-            renderLoginPage({
-              request_id,
-              error: errMsg,
-              username: typeof username === 'string' ? username : '',
-              client_name: client?.client_name ?? 'Claude',
-            }),
-          );
+        page(err instanceof StreamlineAuthError ? err.status : 502, viaCode
+          ? { mode: 'code', code_sent: true, error: errMsg }
+          : { error: errMsg });
       }
     },
 

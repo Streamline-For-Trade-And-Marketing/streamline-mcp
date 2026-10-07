@@ -30,6 +30,12 @@ interface RenderOpts {
   username?: string;
   /** Display name of the OAuth client asking for access ("Claude" usually). */
   client_name?: string;
+  /** `code` = sign in with a one-time code sent by email. */
+  mode?: 'password' | 'code';
+  /** Code mode: the code was sent, so show the code field. */
+  code_sent?: boolean;
+  /** Neutral notice (e.g. "the code was sent", "the invitation was resent"). */
+  info?: string | null;
 }
 
 function escape(s: string): string {
@@ -44,6 +50,54 @@ export function renderLoginPage(opts: RenderOpts): string {
   const error = opts.error ? escape(opts.error) : '';
   const username = opts.username ? escape(opts.username) : '';
   const clientName = opts.client_name ? escape(opts.client_name) : 'Claude';
+  const info = opts.info ? escape(opts.info) : '';
+  const requestId = escape(opts.request_id);
+  const switchForm = (step: string, label: string) => `
+    <form method="POST" action="/oauth/authorize" class="switch">
+      <input type="hidden" name="request_id" value="${requestId}" />
+      <input type="hidden" name="step" value="${step}" />
+      <input type="hidden" name="username" value="${username}" />
+      <button type="submit" class="link">${label}</button>
+    </form>`;
+  const passwordForm = `
+    <form method="POST" action="/oauth/authorize" autocomplete="on">
+      <input type="hidden" name="request_id" value="${requestId}" />
+      <div class="field">
+        <label for="username">البريد الإلكتروني أو رقم الجوال</label>
+        <input type="text" id="username" name="username" value="${username}" required autofocus autocomplete="username" />
+      </div>
+      <div class="field">
+        <label for="password">كلمة المرور</label>
+        <input type="password" id="password" name="password" required autocomplete="current-password" />
+      </div>
+      <button type="submit" class="submit">تسجيل الدخول والموافقة</button>
+    </form>
+    ${switchForm('code_mode', 'الدخول برمز على البريد')}`;
+  const codeForm = opts.code_sent
+    ? `
+    <form method="POST" action="/oauth/authorize" autocomplete="off">
+      <input type="hidden" name="request_id" value="${requestId}" />
+      <input type="hidden" name="step" value="verify_code" />
+      <input type="hidden" name="username" value="${username}" />
+      <div class="field">
+        <label for="code">رمز الدخول المرسل إلى ${username}</label>
+        <input type="text" id="code" name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" required autofocus autocomplete="one-time-code" class="code" />
+      </div>
+      <button type="submit" class="submit">تسجيل الدخول والموافقة</button>
+    </form>
+    ${switchForm('send_code', 'إعادة إرسال الرمز')}
+    ${switchForm('password_mode', 'الدخول بكلمة المرور')}`
+    : `
+    <form method="POST" action="/oauth/authorize" autocomplete="on">
+      <input type="hidden" name="request_id" value="${requestId}" />
+      <input type="hidden" name="step" value="send_code" />
+      <div class="field">
+        <label for="username">البريد الإلكتروني</label>
+        <input type="email" id="username" name="username" value="${username}" required autofocus autocomplete="email" />
+      </div>
+      <button type="submit" class="submit">أرسل رمز الدخول</button>
+    </form>
+    ${switchForm('password_mode', 'الدخول بكلمة المرور')}`;
   return `<!doctype html>
 <html lang="ar" dir="rtl">
 <head>
@@ -165,6 +219,28 @@ export function renderLoginPage(opts: RenderOpts): string {
       line-height: 1.6;
     }
     .footer strong { color: #5A6A7E; }
+    .info {
+      background: #ECFDF5;
+      color: #065F46;
+      padding: 10px 14px;
+      border-radius: 10px;
+      font-size: 13px;
+      margin-bottom: 14px;
+      border: 1px solid #A7F3D0;
+    }
+    .switch { margin-top: 10px; text-align: center; }
+    .link {
+      background: none;
+      border: none;
+      color: #0F5A78;
+      font: inherit;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      padding: 6px;
+    }
+    .link:hover { text-decoration: underline; }
+    input.code { letter-spacing: 8px; text-align: center; font-size: 20px; }
   </style>
 </head>
 <body>
@@ -178,19 +254,9 @@ export function renderLoginPage(opts: RenderOpts): string {
     </div>
 
     ${error ? `<div class="error">${error}</div>` : ''}
+    ${info ? `<div class="info">${info}</div>` : ''}
 
-    <form method="POST" action="/oauth/authorize" autocomplete="on">
-      <input type="hidden" name="request_id" value="${escape(opts.request_id)}" />
-      <div class="field">
-        <label for="username">البريد الإلكتروني أو رقم الجوال</label>
-        <input type="text" id="username" name="username" value="${username}" required autofocus autocomplete="username" />
-      </div>
-      <div class="field">
-        <label for="password">كلمة المرور</label>
-        <input type="password" id="password" name="password" required autocomplete="current-password" />
-      </div>
-      <button type="submit" class="submit">تسجيل الدخول والموافقة</button>
-    </form>
+    ${opts.mode === 'code' ? codeForm : passwordForm}
 
     <div class="footer">
       ${clientName} رح يقدر يقرا ويعدّل بياناتك في Streamline حسب صلاحياتك.<br/>

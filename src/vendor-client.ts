@@ -158,10 +158,10 @@ export class VendorClient {
    * success envelope (`{ success, data, message }`). Use `getRaw` if
    * you need the full envelope (e.g. to read `meta`).
    */
-  async get<T = any>(path: string, params?: Record<string, any>): Promise<T> {
+  async get<T = any>(path: string, params?: Record<string, any>, headers?: Record<string, string>): Promise<T> {
     await this.bucket.take();
     try {
-      const res = await this.axios.get(path, { params });
+      const res = await this.axios.get(path, { params, headers });
       return (res.data?.data ?? res.data) as T;
     } catch (err) {
       throw this.normaliseError(err);

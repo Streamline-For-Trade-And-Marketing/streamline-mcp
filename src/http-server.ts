@@ -48,6 +48,10 @@ import { buildTools } from './tools.js';
 import { zodToJsonSchema } from './zod-to-jsonschema.js';
 
 const PORT = Number(process.env.PORT) || 3000;
+// Same host the OAuth login talks to, so a staging login never drives the production API.
+const VENDOR_API_BASE =
+  process.env.STREAMLINE_BASE ||
+  `${process.env.STREAMLINE_API_BASE || 'https://api.streamline.com.sa'}/vendor/v1`;
 const HOST = process.env.HOST || '0.0.0.0';
 
 const app = express();
@@ -165,7 +169,7 @@ app.get('/', (req, res, next) => {
 });
 
 app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', service: 'streamline-mcp', version: '0.7.0' });
+  res.json({ status: 'ok', service: 'streamline-mcp', version: '0.8.0' });
 });
 
 // ── OAuth discovery + endpoints ─────────────────────────────────
@@ -325,12 +329,12 @@ async function mcpHandler(req: Request, res: Response): Promise<void> {
   // We also DROP the manual initialize short-circuit and let the
   // SDK build the response in its own (always-valid) format. Less
   // surface area for a typo to invalidate the handshake.
-  const api = new VendorClient({ token: vendor_token });
+  const api = new VendorClient({ token: vendor_token, baseURL: VENDOR_API_BASE });
   const tools = buildTools(api);
   const toolsByName = new Map(tools.map((t) => [t.name, t]));
 
   const server = new Server(
-    { name: 'streamline-mcp', version: '0.7.0' },
+    { name: 'streamline-mcp', version: '0.8.0' },
     { capabilities: { tools: {} } },
   );
 
@@ -466,12 +470,12 @@ app.get('/sse', bearerAuth, async (req: Request, res: Response) => {
   // Spin up a fresh per-vendor Server + tool set, connected via the
   // SSE transport. Same wiring as the /mcp path; only the transport
   // differs.
-  const api = new VendorClient({ token: vendor_token });
+  const api = new VendorClient({ token: vendor_token, baseURL: VENDOR_API_BASE });
   const tools = buildTools(api);
   const toolsByName = new Map(tools.map((t) => [t.name, t]));
 
   const server = new Server(
-    { name: 'streamline-mcp', version: '0.7.0' },
+    { name: 'streamline-mcp', version: '0.8.0' },
     { capabilities: { tools: {} } },
   );
 

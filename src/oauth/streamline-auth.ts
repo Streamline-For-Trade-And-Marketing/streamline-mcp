@@ -56,9 +56,39 @@ export async function loginToStreamline(
   const fd = new FormData();
   fd.append('username', username);
   fd.append('password', password);
-  let res;
+  return sessionFrom(await postToStreamline('/api/v1/login', fd), 'Invalid email or password.');
+}
+
+/** Emails a one-time sign-in code; invited staff get their invitation again instead. */
+export async function sendStreamlineLoginCode(
+  email: string,
+): Promise<{ invitationSent: boolean; message: string }> {
+  if (!email) throw new StreamlineAuthError('البريد الإلكتروني مطلوب.', 400);
+  const fd = new FormData();
+  fd.append('email', email.trim().toLowerCase());
+  const res = await postToStreamline('/vendor/v1/login/send-code', fd);
+  if (res.status !== 200 || !res.data?.success) {
+    throw new StreamlineAuthError(res.data?.message || 'تعذّر إرسال الرمز.', res.status || 400);
+  }
+  return { invitationSent: Boolean(res.data?.data?.invitation_sent), message: res.data?.message || '' };
+}
+
+export async function loginToStreamlineWithCode(
+  email: string,
+  code: string,
+): Promise<StreamlineLoginResult> {
+  if (!email || !/^\d{6}$/.test(code)) {
+    throw new StreamlineAuthError('أدخل الرمز المكوّن من ٦ أرقام.', 400);
+  }
+  const fd = new FormData();
+  fd.append('email', email.trim().toLowerCase());
+  fd.append('code', code);
+  return sessionFrom(await postToStreamline('/vendor/v1/login/code', fd), 'الرمز غير صحيح.');
+}
+
+async function postToStreamline(path: string, fd: FormData) {
   try {
-    res = await axios.post(`${DEFAULT_API_BASE}/api/v1/login`, fd, {
+    return await axios.post(`${DEFAULT_API_BASE}${path}`, fd, {
       headers: { 'Accept-Language': 'ar', Accept: 'application/json' },
       timeout: 15_000,
       validateStatus: () => true,
@@ -66,12 +96,12 @@ export async function loginToStreamline(
   } catch {
     throw new Error('Could not reach Streamline. Please try again.');
   }
+}
+
+function sessionFrom(res: { status: number; data: any }, fallback: string): StreamlineLoginResult {
   const body = res.data;
-  // The login endpoint returns { success, status, data: { ..., access_token } }
-  // on success and a non-success shape on bad creds.
   if (res.status !== 200 || !body?.success) {
-    const msg = body?.message || 'Invalid email or password.';
-    throw new StreamlineAuthError(msg, res.status || 401);
+    throw new StreamlineAuthError(body?.message || fallback, res.status || 401);
   }
   const user = body.data;
   const token = user?.access_token;
@@ -82,7 +112,6 @@ export async function loginToStreamline(
     );
   }
   if (user.type !== 'vendor' && user.type !== 'employee') {
-    // Customers / admins shouldn't be using this MCP at all.
     throw new StreamlineAuthError(
       'This account type is not supported by the vendor MCP.',
       403,

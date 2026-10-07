@@ -9,12 +9,16 @@ Two flavours ship from one repo:
 | **stdio** (`dist/index.js`) | stdin/stdout | env token | single-vendor | Claude Desktop / Code, your own account |
 | **HTTP** (`dist/http-server.js`) | Streamable HTTP | OAuth 2.1 + PKCE | multi-vendor | claude.ai custom connector, any vendor |
 
-## Tool surface (32 tools)
+## Tool surface (32 tools, action-based)
 
-- **Read:** `get_profile`, `get_current_time`, `list_branches`, `get_branch`, `list_bookings`, `get_booking`, `get_calendar`, `list_services`, `list_sections`, `list_employees`, `list_customers`, `get_customer`, `list_offers`, `get_reports`, `get_wallet`
-- **Write:** `create_booking`, `update_booking_notes`, `cancel_booking`, `complete_booking`, `mark_no_show`, `reschedule_booking`, `create_section`, `create_service`, `update_service`, `update_service_price`, `activate_service`, `deactivate_service`, `create_customer`, `create_employee`, `activate_employee`, `deactivate_employee`, `create_offer`
+- **Context:** `get_profile`, `get_current_time`, `get_wallet`, `get_reports`, `get_calendar`, `preview_booking`, `list_permissions`
+- **Bookings:** `booking` (list/get/create incl. per-service staff and products-only counter sales, cancel/complete/no-show status-only, approve/reject home requests, item_status, reschedule keeping each service's specialist, notes, set_customer, payment), `payment_link` (QR / pay-by-link)
+- **Catalogue:** `section`, `service`, `offer`, `product`, `bundle`, `promo_code`
+- **Team & access:** `employee` (invitations, busy windows), `employee_portfolio`, `role`
+- **Customers:** `customer`, `review`, `cancellation_reason`
+- **Business:** `branch`, `settings`, `business_profile`, `reminder`, `reminder_channels`, `google_calendar`, `invoice`, `online_payment`, `subscription`, `zatca`, `account`
 
-See `src/tools.ts` for full descriptions, schemas, and confirm-before-write rules.
+Deletes and refunds are intentionally not exposed. See `src/tools.ts` for each action's fields.
 
 ---
 
@@ -76,8 +80,10 @@ MCP_PUBLIC_URL=https://abc-123-xyz.ngrok-free.app npm run start:http
 3. Claude auto-discovers the OAuth endpoints (`/.well-known/oauth-authorization-server`).
 4. Claude registers itself via Dynamic Client Registration (`POST /oauth/register`).
 5. Click **Connect** → browser opens the Streamline-branded login page.
-6. Enter your Streamline email + password → the MCP validates against `api.streamline.com.sa/api/v1/login` and redirects back to Claude with an auth code.
+6. Enter your Streamline email + password (or an emailed code) → the MCP validates against the Streamline API and redirects back to Claude with an auth code.
 7. Claude exchanges the code for an access token. **You're done.** 32 tools are live.
+
+Accounts without a password (Google/Apple sign-ups, invited staff) use **«الدخول برمز على البريد»** on the same page: a 6-digit code is emailed by `/vendor/v1/login/send-code`.
 
 ### 6. Try it
 
