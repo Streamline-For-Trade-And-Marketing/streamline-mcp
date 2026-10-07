@@ -32,35 +32,24 @@ import express, { type Request, type Response } from 'express';
 import { VendorClient } from './vendor-client.js';
 import { buildTools } from './tools.js';
 import { runGeminiChat, type ChatMessage } from './gemini-bridge.js';
+import { nowSaudi } from './time.js';
 
 const PORT = Number(process.env.CHAT_PORT) || 8011;
 const HOST = process.env.HOST || '0.0.0.0';
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
-// Model rotation: we try these in order and fall through to the next one on a
-// rate-limit (429). Free-tier quotas are mostly per-minute and each model —
-// incl. the Gemma family, which DOES support function-calling — has its own
-// pool, so rotating multiplies our effective free throughput and keeps the
-// assistant alive instead of dying on a single model's quota.
-// Tried IN ORDER; the bridge rotates to the next on ANY error and unavailable
-// IDs are skipped, so it is safe to list many. Order = priority: fast/cheap
-// Gemini flash first → newer 3.x flash → pro tier → Gemma LAST (free but slow).
-// GEMINI_MODELS in .env.chat overrides this list.
+// Free-tier models, strongest first; 2.0 is shut down, 2.5 Pro closed to new users, 3.1 Pro paid-only.
 const DEFAULT_MODELS = [
-  'gemini-2.5-flash-lite',
-  'gemini-flash-lite-latest',
-  'gemini-2.0-flash-lite',
-  'gemini-2.0-flash',
-  'gemini-2.5-flash',
-  'gemini-flash-latest',
-  'gemini-3.1-flash-lite',
+  'gemini-3.6-flash',
+  'gemini-3.7-flash',
+  'gemini-3.8-flash',
   'gemini-3.5-flash',
+  'gemini-2.5-flash',
   'gemini-3-flash-preview',
-  'gemini-2.5-pro',
-  'gemini-pro-latest',
-  'gemini-3-pro-preview',
-  'gemini-3.1-pro-preview',
-  'gemma-4-31b-it',
+  'gemini-3.5-flash-lite',
+  'gemini-3.1-flash-lite',
+  'gemini-2.5-flash-lite',
   'gemma-4-26b-a4b-it',
+  'gemma-4-31b-it',
 ];
 // GEMINI_MODELS (comma-separated) overrides; GEMINI_MODEL kept for back-compat.
 const MODELS = (process.env.GEMINI_MODELS || process.env.GEMINI_MODEL || '')
@@ -183,6 +172,11 @@ USING TOOLS
 - Several resources are "umbrella" tools that take an "action" field (e.g. booking, service, employee, offer, branch, section, promo_code, role, reminder, account). Read each tool's description for which fields each action needs.
 - You may chain tools: e.g. list to find an id, then act on it. Resolve names → ids yourself via the list/get tools rather than asking the user for an id.
 
+MEMORY
+- The SHOP MEMORY below holds the owner's numbered standing preferences; follow them. When the owner's message changed the memory, a "(ذاكرة: …)" note at its end says exactly what was saved or removed: confirm it in one short line.
+- Never claim you saved, changed or forgot something unless that note (or a successful ai_memory call) says so. If the owner wants something remembered and nothing was saved, save it with ai_memory.
+- Talk to the owner the way they talk (their dialect, tone and phrases), as described in the memory.
+
 WRITES & SAFETY
 - Read actions: perform them freely.
 - Write actions (create / update / cancel / complete / reschedule / activate / deactivate / change settings): if the user's request is clear and explicit, do it, then confirm what changed. If anything important is ambiguous (which branch, which customer, price, time), briefly confirm the key details FIRST instead of guessing.
@@ -198,6 +192,38 @@ STYLE
 // weaker Gemma fallbacks — in "this is a question about my Streamline account".
 const STREAMLINE_CONTEXT_SUFFIX =
   '\n\n(هذا الطلب يخص حسابي في منصة Streamline — استخدم أدوات Streamline وجاوب من بيانات حسابي.)';
+
+const BUSY_REPLY = 'تعذّر تشغيل المساعد حاليًا 🙏 جرّب بعد قليل.';
+
+function memoryNote(memory?: Memory | null): string {
+  if (memory?.remembered) {
+    return memory.replaced
+      ? `(ذاكرة: حفظت «${memory.remembered}» بدل «${memory.replaced}».)`
+      : `(ذاكرة: حفظت «${memory.remembered}».)`;
+  }
+  return memory?.forgotten ? `(ذاكرة: حذفت «${memory.forgotten}».)` : '';
+}
+const MAX_HISTORY = 16;
+const MAX_USER_CHARS = 1000;
+const MAX_REPLY_CHARS = 2000;
+const MAX_HOPS = 6;
+
+type Usage = { used: number; limit: number };
+type Memory = { remembered?: string; replaced?: string | null; forgotten?: string };
+type Turn = { context: string; usage?: Usage; memory?: Memory | null } | { status: number; reply: string };
+
+// The backend gates the assistant (package feature + daily/minute limits) and hands back the shop memory.
+async function startTurn(api: VendorClient, lang: string, message?: string): Promise<Turn> {
+  try {
+    const data: any = await api.post('/ai/chat-turn', message ? { message } : {}, { headers: { 'Accept-Language': lang } });
+    return { context: String(data?.context || ''), usage: data?.usage, memory: data?.memory ?? null };
+  } catch (err: any) {
+    if ([401, 403, 429].includes(err?.status)) {
+      return { status: err.status, reply: String(err?.raw?.message || BUSY_REPLY) };
+    }
+    return { context: '' };
+  }
+}
 
 const app = express();
 app.disable('x-powered-by');
@@ -272,7 +298,12 @@ app.post('/chat', async (req: Request, res: Response) => {
         typeof x.content === 'string' &&
         x.content.trim(),
     )
-    .map((x) => ({ role: x.role, content: String(x.content) }));
+    .slice(-MAX_HISTORY)
+    .map((x) => ({
+      role: x.role,
+      content: String(x.content).slice(0, x.role === 'user' ? MAX_USER_CHARS : MAX_REPLY_CHARS),
+    }));
+  while (messages.length > 0 && messages[0].role !== 'user') messages.shift();
 
   if (messages.length === 0) {
     res
@@ -280,6 +311,9 @@ app.post('/chat', async (req: Request, res: Response) => {
       .json({ error: 'Body must include messages[] of { role: "user"|"assistant", content: string }.' });
     return;
   }
+
+  const last = messages[messages.length - 1];
+  const typed = req.body?.typed !== false && last?.role === 'user' ? last.content : undefined;
 
   // Pin the latest request to the Streamline context by appending the hint to
   // the END of the most recent user message (weaker models weight the tail most).
@@ -292,15 +326,32 @@ app.post('/chat', async (req: Request, res: Response) => {
 
   try {
     const api = new VendorClient({ token, baseURL: STREAMLINE_BASE });
+    const lang = req.body?.lang === 'en' || req.body?.lang === 'tr' ? req.body.lang : 'ar';
+    const turn = await startTurn(api, lang, typed);
+    if ('status' in turn) {
+      res.status(turn.status).json({ reply: turn.reply, toolCalls: [], limited: turn.status === 429 });
+      return;
+    }
+    const note = memoryNote(turn.memory);
+    if (note) {
+      const at = messages.length - 1;
+      messages[at] = { ...messages[at], content: `${messages[at].content}\n${note}` };
+    }
     const tools = buildTools(api);
+    const now = nowSaudi();
     const result = await runGeminiChat({
       apiKey: activeKey,
       models: activeModels,
-      systemInstruction: SYSTEM_INSTRUCTION,
+      systemInstruction:
+        `${SYSTEM_INSTRUCTION}\n\nNOW (Asia/Riyadh): ${now.date} ${now.time}, ${now.weekday_ar}. Use it for today/this week/this month without asking.` +
+        (turn.context
+          ? `\n\nSHOP MEMORY (facts about this shop and the owner's standing preferences; follow them, and keep them current with ai_memory when the owner states a new lasting preference or asks to drop one):\n${turn.context}`
+          : ''),
       tools,
       messages,
+      maxHops: MAX_HOPS,
     });
-    res.json(result);
+    res.json({ ...result, usage: turn.usage, memory: turn.memory || undefined });
   } catch (err: any) {
     const status = err?.response?.status;
     const gemError = err?.response?.data?.error;
@@ -311,7 +362,7 @@ app.post('/chat', async (req: Request, res: Response) => {
     // Never surface a raw error/stack to the UI. Respond 200 with a gentle
     // line so the page shows a calm "try again" bubble, not a red 5xx.
     res.json({
-      reply: 'تعذّر تشغيل المساعد حاليًا 🙏 جرّب بعد قليل.',
+      reply: BUSY_REPLY,
       toolCalls: [],
       unavailable: true,
     });

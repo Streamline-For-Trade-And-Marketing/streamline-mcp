@@ -232,6 +232,16 @@ const GLOBAL_CONVENTIONS = `GLOBAL CONVENTIONS (every reply):
 //  TOOL BUILDER
 // ════════════════════════════════════════════════════════════════════
 
+function memoryView(data: any, withSummary = false): any {
+  return clean({
+    summary: withSummary ? data?.summary : undefined,
+    preferences: (data?.notes || []).map((note: any, index: number) => `${index + 1}. ${note.text}`),
+    remembered: data?.remembered ?? undefined,
+    replaced: data?.replaced ?? undefined,
+    forgotten: data?.forgotten ?? undefined,
+  });
+}
+
 export function buildTools(api: VendorClient): ToolDef[] {
   return [
     // ════════════════════════════════════════════════════════════════
@@ -253,6 +263,29 @@ export function buildTools(api: VendorClient): ToolDef[] {
         'Current Saudi date/time (Asia/Riyadh): `date` (YYYY-MM-DD), `time` (HH:MM), `weekday_ar`, `human`. Call it before anything relative to today, then pass local_datetime to booking actions.',
       inputSchema: z.object({}),
       handler: async () => nowSaudi(),
+    },
+
+    {
+      name: 'ai_memory',
+      description:
+        'Streamline AI memory: the owner\'s standing preferences (numbered, max 10) that every Streamline AI suggestion follows. action: list (shop summary + preferences) · remember (note = a lasting preference the owner states, in their words, max 100 chars; replaces = the number of the preference it updates or contradicts) · forget (number). Save only what the owner wants kept for the future, never one-off requests.',
+      inputSchema: z.object({
+        action: z.enum(['list', 'remember', 'forget']),
+        note: z.string().min(2).max(100).optional(),
+        replaces: z.number().int().min(0).max(10).optional(),
+        number: z.number().int().min(1).max(10).optional(),
+      }),
+      handler: async (input) => {
+        if (input.action === 'remember') {
+          if (!input.note) throw new Error('remember needs note.');
+          return memoryView(await api.post('/ai/memory', clean({ note: input.note, replaces: input.replaces })));
+        }
+        if (input.action === 'forget') {
+          if (!input.number) throw new Error('forget needs number.');
+          return memoryView(await api.delete(`/ai/memory/${input.number}`));
+        }
+        return memoryView(await api.get('/ai/profile'), true);
+      },
     },
 
     {

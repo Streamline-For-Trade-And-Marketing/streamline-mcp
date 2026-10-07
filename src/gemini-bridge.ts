@@ -70,20 +70,44 @@ export interface GeminiChatResult {
 export const BUSY_MESSAGE =
   'الخدمة مشغولة حاليًا 🙏 كل النماذج المجانية وصلت حدّها المؤقت. جرّب بعد دقيقة.';
 
-// A model that just 429'd is parked here for ~a minute so we don't waste a
-// round-trip re-trying it on every request while its per-minute quota refills.
+// Failed models rest: busy → a minute (or Google's retryDelay), hung → 5 min,
+// daily quota spent → until the Pacific-midnight reset, retired → a day.
 const cooldownUntil = new Map<string, number>();
 const COOLDOWN_MS = 60_000;
+const HUNG_COOLDOWN_MS = 5 * 60_000;
+const GONE_COOLDOWN_MS = 24 * 60 * 60_000;
+const CALL_TIMEOUT_MS = 15_000;
+// Tool chats need a little planning: low thinking keeps them agentic without the slow default.
+function thinkingFor(model: string): Record<string, unknown> {
+  if (model.startsWith('gemma')) return {};
+  if (model.startsWith('gemini-2.5')) return { thinkingConfig: { thinkingBudget: 512 } };
+  return { thinkingConfig: { thinkingLevel: 'low' } };
+}
+
+function msUntilQuotaReset(): number {
+  const pacific = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
+  const reset = new Date(pacific);
+  reset.setHours(24, 1, 0, 0);
+  return reset.getTime() - pacific.getTime();
+}
+
+function cooldownFor(err: any): number {
+  const status = err?.response?.status;
+  const details: any[] = err?.response?.data?.error?.details || [];
+  if (details.some((d) => (d?.violations || []).some((v: any) => /PerDay/.test(String(v?.quotaId || ''))))) {
+    return msUntilQuotaReset();
+  }
+  const retry = parseFloat(String(details.find((d) => String(d?.['@type'] || '').endsWith('RetryInfo'))?.retryDelay || ''));
+  if (Number.isFinite(retry) && retry > 0) return retry * 1000 + 1000;
+  if (status === 404) return GONE_COOLDOWN_MS;
+  if (status === 429 || status >= 500) return COOLDOWN_MS;
+  return err?.code === 'ECONNABORTED' ? HUNG_COOLDOWN_MS : 0;
+}
 
 /**
- * POST `:generateContent`, rotating across `models` on rate-limit / overload.
- *
- * Free-tier Gemini quotas are mostly PER-MINUTE, and each model (plus the
- * Gemma family) has its OWN pool — so when one model 429s we just move to the
- * next instead of failing the whole turn. `state.idx` advances and persists
- * across a conversation's tool-round-trips so we stop hammering a model that
- * already said it's out. Only when EVERY model fails do we raise
- * `ALL_MODELS_EXHAUSTED` (which the caller turns into BUSY_MESSAGE).
+ * POST `:generateContent`, rotating down `models` (strongest first) on any failure.
+ * `state.idx` persists across a conversation's tool round-trips; only when EVERY
+ * model fails do we raise `ALL_MODELS_EXHAUSTED` (the caller shows BUSY_MESSAGE).
  */
 async function callGemini(
   apiKey: string,
@@ -94,34 +118,27 @@ async function callGemini(
   let lastErr: any = null;
   for (let i = state.idx; i < models.length; i++) {
     const model = models[i];
-    // Skip a model still inside its post-429 cooldown window.
     if ((cooldownUntil.get(model) ?? 0) > Date.now()) continue;
-    const url = `${GEMINI_HOST}/models/${encodeURIComponent(
-      model,
-    )}:generateContent?key=${apiKey}`;
+    const url = `${GEMINI_HOST}/models/${encodeURIComponent(model)}:generateContent`;
     try {
-      const res = await axios.post(url, body, {
-        headers: { 'Content-Type': 'application/json' },
-        timeout: 60_000,
-      });
+      const res = await axios.post(
+        url,
+        { ...body, generationConfig: { ...body.generationConfig, ...thinkingFor(model) } },
+        { headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey }, timeout: CALL_TIMEOUT_MS },
+      );
       state.idx = i;
       state.last = model;
       return { data: res.data, model };
     } catch (err: any) {
       lastErr = err;
       const status = err?.response?.status;
-      // Park rate-limited / overloaded models so the next request skips them.
-      if (status === 429 || status === 503) {
-        cooldownUntil.set(model, Date.now() + COOLDOWN_MS);
-      }
-      const detail = err?.response?.data?.error?.status || err?.message || '';
+      const detail = err?.response?.data?.error?.message || err?.message || '';
+      const rest = cooldownFor(err);
+      if (rest > 0) cooldownUntil.set(model, Date.now() + rest);
       // eslint-disable-next-line no-console
       console.error(
-        `[gemini] model "${model}" failed (status=${status} ${String(detail).slice(0, 60)}) → trying next`,
+        `[gemini] model "${model}" failed (status=${status ?? err?.code} ${String(detail).slice(0, 60)}) → resting ${Math.round(rest / 1000)}s, trying next`,
       );
-      // Fall through to the next model on ANY error so one bad/exhausted
-      // model never takes the request down. Real bugs still show up in
-      // these logs; the user only ever sees BUSY_MESSAGE if ALL fail.
       continue;
     }
   }

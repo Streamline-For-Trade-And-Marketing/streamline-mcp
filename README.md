@@ -9,7 +9,7 @@ Two flavours ship from one repo:
 | **stdio** (`dist/index.js`) | stdin/stdout | env token | single-vendor | Claude Desktop / Code, your own account |
 | **HTTP** (`dist/http-server.js`) | Streamable HTTP | OAuth 2.1 + PKCE | multi-vendor | claude.ai custom connector, any vendor |
 
-## Tool surface (32 tools, action-based)
+## Tool surface (33 tools, action-based)
 
 - **Context:** `get_profile`, `get_current_time`, `get_wallet`, `get_reports`, `get_calendar`, `preview_booking`, `list_permissions`
 - **Bookings:** `booking` (list/get/create incl. per-service staff and products-only counter sales, cancel/complete/no-show status-only, approve/reject home requests, item_status, reschedule keeping each service's specialist, notes, set_customer, payment), `payment_link` (QR / pay-by-link)
@@ -17,6 +17,7 @@ Two flavours ship from one repo:
 - **Team & access:** `employee` (invitations, busy windows), `employee_portfolio`, `role`
 - **Customers:** `customer`, `review`, `cancellation_reason`
 - **Business:** `branch`, `settings`, `business_profile`, `reminder`, `reminder_channels`, `google_calendar`, `invoice`, `online_payment`, `subscription`, `zatca`, `account`
+- **Streamline AI:** `ai_memory` (shop summary and the owner's preferences: remember, update, forget)
 
 Deletes and refunds are intentionally not exposed. See `src/tools.ts` for each action's fields.
 

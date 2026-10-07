@@ -193,12 +193,12 @@ export class VendorClient {
   async post<T = any>(
     path: string,
     body?: Record<string, any>,
-    opts: { multipart?: boolean; timeoutMs?: number } = {},
+    opts: { multipart?: boolean; timeoutMs?: number; headers?: Record<string, string> } = {},
   ): Promise<T> {
     await this.bucket.take();
     try {
       let payload: any = body;
-      let headers: Record<string, string> = {};
+      let headers: Record<string, string> = { ...opts.headers };
       if (opts.multipart && body) {
         const fd = new FormData();
         const debugFields: string[] = [];
