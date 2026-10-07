@@ -204,7 +204,7 @@ async function permissionCatalogue(api: VendorClient): Promise<{ byName: Map<str
   for (const [label, rows] of Object.entries<any>(grouped || {})) {
     const group = PERMISSION_GROUP_SLUGS[label] ?? label.replace(/^api\./, '').toLowerCase().replace(/\s+/g, '-');
     for (const row of Array.isArray(rows) ? rows : []) {
-      const name = `${group}.${String(row.name).toLowerCase()}`;
+      const name = `${group}.${String(row.name).replace(/^api\./, '').toLowerCase()}`;
       byName.set(name, Number(row.id));
       byId.set(Number(row.id), name);
     }
@@ -396,7 +396,7 @@ export function buildTools(api: VendorClient): ToolDef[] {
         'Bookings. ACTIONS:\n' +
         '• list — filters: branch_id, employee_id, customer_id, status (confirmed/completed/canceled/missed/not_confirmed), exclude_status[], date (YYYY-MM-DD) with optional date_to for a range, page, per_page.\n' +
         '• get — id. `service_lines[]` holds one row per service (id, name, employee, start/end, status); `awaiting_approval` marks a pending home-service request.\n' +
-        '• create — branch_id + at least one of service_ids / offer_ids / product_ids. Staff for services/offers: employee_id (one specialist for all), or employee_assignments {"service:<service_id>" | "offer:<offer_id>:<service_id>" | "offer:<offer_id>": employee_id} (keys left out = any free specialist), or any_employee=true (may fail with "no specialist available"). Time: local_datetime (omit = now). Products only = a counter sale: no staff or time needed (employee_id = optional seller). Optional: customer_id (omit = walk-in "عميل تلقائي", never ask for one the vendor didn\'t mention), sub_service_ids (REQUIRED for a service with variants: {"<service_id>": <sub_service_id>}), product_prices, prices / durations (per service id), offer_prices / offer_durations (per offer id), discount (flat SAR), notes, payment_way (cash/online), apply_bundles (default true: an active prepaid bundle of the customer covers matching lines), complete=true (ring up the sale now: completes it and marks it paid).\n' +
+        '• create — branch_id + at least one of service_ids / offer_ids / product_ids. Staff for services/offers: employee_id (one specialist for all), or employee_assignments {"service:<service_id>" | "offer:<offer_id>:<service_id>" | "offer:<offer_id>": employee_id} (keys left out = any free specialist), or any_employee=true (may fail with "no specialist available"). Time: local_datetime (omit = now). Products only = a counter sale: no staff or time needed (employee_id = optional seller); it is rung up as completed unless complete=false. Optional: customer_id (omit = walk-in "عميل تلقائي", never ask for one the vendor didn\'t mention), sub_service_ids (REQUIRED for a service with variants: {"<service_id>": <sub_service_id>}), product_prices, prices / durations (per service id), offer_prices / offer_durations (per offer id), discount (flat SAR), notes, payment_way (cash; card payments go through payment_link), apply_bundles (default true: an active prepaid bundle of the customer covers matching lines), complete=true (ring up the sale now: completes it and marks it paid).\n' +
         '• cancel / complete / mark_no_show — status only; lines, staff and prices stay. cancel takes optional cancellation_reason or cancel_reason_id.\n' +
         '• approve / reject — decide a pending home-service request (awaiting_approval=true); reject takes an optional reason shown to the customer. Never cancel or complete such a request.\n' +
         '• item_status — one service of a visit: id + item_id (a service_lines id) + item_status (pending/completed/canceled/missed). The visit completes once every service is completed.\n' +
@@ -494,10 +494,14 @@ export function buildTools(api: VendorClient): ToolDef[] {
             if (!timed && !(input.product_ids?.length)) {
               throw new Error('action="create" needs service_ids, offer_ids or product_ids.');
             }
+            if (input.complete && input.payment_way === 'online') {
+              throw new Error('A completed sale can only be recorded as cash here. To collect a card payment, create the booking and use payment_link.');
+            }
             const assigned = input.employee_assignments && Object.keys(input.employee_assignments).length > 0;
             if (timed && input.employee_id == null && !assigned && !input.any_employee) {
               throw new Error('action="create" needs employee_id, employee_assignments or any_employee=true for services/offers.');
             }
+            const complete = input.complete ?? !timed;
             const nonEmpty = (m?: Record<string, any>) => (m && Object.keys(m).length > 0 ? m : undefined);
             const created: any = await api.post(
               '/bookings',
@@ -518,14 +522,14 @@ export function buildTools(api: VendorClient): ToolDef[] {
                 offer_durations: nonEmpty(input.offer_durations),
                 discount: input.discount,
                 booking_timestamp: bookingTimestamp(input),
-                future_booking: input.complete ? '0' : '1',
+                future_booking: complete ? '0' : '1',
                 payment_way: input.payment_way ?? 'cash',
                 apply_bundles: bool01(input.apply_bundles),
               }),
               { multipart: true },
             );
             const followUp: Record<string, any> = {};
-            if (input.complete) Object.assign(followUp, { status: 'completed', payment_status: '1' });
+            if (complete) Object.assign(followUp, { status: 'completed', payment_status: '1' });
             if (input.notes && input.notes.trim().length >= 3) followUp.notes = input.notes.trim();
             if (created?.id && Object.keys(followUp).length > 0) {
               return present(await statusOnly(created.id, followUp));
@@ -621,7 +625,7 @@ export function buildTools(api: VendorClient): ToolDef[] {
     {
       name: 'branch',
       description:
-        'Branches.\nACTIONS:\n• list — optional q, active_only. • get — id.\n• create — name, address, lat, long, official_hours [{day, start_time, end_time}] (sat…fri, HH:MM). Use places_search → places_location to fill address/lat/long. Optional home delivery: offers_home_services, is_cloud (home-only branch, implies home services), home_pricing_type fixed (home_fixed_fee) or by_distance (home_pricing_tiers [{up_to_minutes, fee}], nearest first; the last tier is the coverage radius — places_reach shows drive times).\n• update — id + any field; the rest is echoed. sync_employee_hours=true also moves this branch\'s employees to the new hours. existing_images = gallery URLs to KEEP (others are deleted; uploads are dashboard-only).\n• activate / deactivate — id.\n• set_busy — id + busy_from (+ optional busy_until, else until clear_busy) pauses new bookings; available_when_busy=false also hides it. • clear_busy — id.\n• places_search (q) / places_details (place_id) / places_location (place_id → address, lat, long) / places_reverse (lat, lng → address) / places_reach (lat, lng → drive-time rays).\n• Google (package feature google_reviews): set_google_place (id + google_place_id, "" unlinks), set_google_reviews (id + show_google_reviews), google_stats (id), google_stats_refresh (id + scope all/employees/competitors; takes 40-90 s).',
+        'Branches.\nACTIONS:\n• list — optional q, active_only. • get — id.\n• create — name, address, lat, long, official_hours [{day, start_time, end_time}] (sat…fri, HH:MM; always the full week — it replaces the stored list). Use places_search → places_location to fill address/lat/long. Optional home delivery: offers_home_services, is_cloud (home-only branch, implies home services), home_pricing_type fixed (home_fixed_fee) or by_distance (home_pricing_tiers [{up_to_minutes, fee}], nearest first, the full list; the last tier is the coverage radius — places_reach shows drive times).\n• update — id + any field; the rest is echoed. sync_employee_hours=true also moves this branch\'s employees to the new hours. existing_images = gallery URLs to KEEP (others are deleted; uploads are dashboard-only).\n• activate / deactivate — id.\n• set_busy — id + busy_from (+ optional busy_until, else until clear_busy) pauses new bookings; available_when_busy=false also hides it. • clear_busy — id.\n• places_search (q) / places_details (place_id) / places_location (place_id → address, lat, long) / places_reverse (lat, lng → address) / places_reach (lat, lng → drive-time rays).\n• Google (package feature google_reviews): set_google_place (id + google_place_id, "" unlinks), set_google_reviews (id + show_google_reviews), google_stats (id), google_stats_refresh (id + scope all/employees/competitors; takes 40-90 s).',
       inputSchema: z.object({
         action: z.enum([
           'list',
@@ -870,7 +874,7 @@ export function buildTools(api: VendorClient): ToolDef[] {
     {
       name: 'service',
       description:
-        'Services.\nACTIONS:\n• list — filters: branch_id, section_id, active_only, q, page, per_page. • get — id (variants, home hours, suggested products).\n• create — name_ar, section_id, branch_id[], and either price + service_time (minutes) or sub_services (variants, each with its own price + service_time). Optional: description_ar, extra_time (buffer minutes), featured, product_ids (suggested products; feature `products`), is_home_service + home_service_fee + home_only + home_hours.\n• update — id + any field; everything else is echoed, including variants with their ids. To remove a variant send sub_services without it (keep the others WITH ids); a variant pinned by an offer can\'t be removed. Turning is_home_service off clears home hours and home_only.\n• update_price — id + price (+ optional service_time); for a service with variants change the variant via update.\n• popular_templates — admin-curated names/descriptions for quick creation.\n• activate / deactivate — id.',
+        'Services.\nACTIONS:\n• list — filters: branch_id, section_id, active_only, q, page, per_page. • get — id (variants, home hours, suggested products).\n• create — name_ar, section_id, branch_id[], and either price + service_time (minutes) or sub_services (variants, each with its own price + service_time). Optional: description_ar, extra_time (buffer minutes), featured, product_ids (suggested products; feature `products`), is_home_service + home_service_fee + home_only + home_hours (the full list; it replaces the stored one).\n• update — id + any field; everything else is echoed, including variants with their ids. To remove a variant send sub_services without it (keep the others WITH ids); a variant pinned by an offer can\'t be removed. Turning is_home_service off clears home hours and home_only.\n• update_price — id + price (+ optional service_time); for a service with variants change the variant via update.\n• popular_templates — admin-curated names/descriptions for quick creation.\n• activate / deactivate — id.',
       inputSchema: z.object({
         action: z.enum(['list', 'get', 'create', 'update', 'update_price', 'popular_templates', 'activate', 'deactivate']),
         id: idLike.optional(),
@@ -1012,7 +1016,7 @@ export function buildTools(api: VendorClient): ToolDef[] {
     {
       name: 'offer',
       description:
-        'Offers (عروض): several services sold together.\nACTIONS:\n• list — optional branch_id, active_only, q, page, per_page. • get — id (services with variants, service_pins).\n• create — name_ar, description_ar, section_id, service_ids, price_type: service (no discount) / free / discount (+ discount_percentage) / special (+ offer_price). service_price = sum of the included services (computed when omitted). Optional sub_service_ids (pin one variant per service; leave a service unpinned to let the customer choose), home delivery fields like services.\n• update — id + any field; the rest is echoed, including variant pins.\n• sort — items [{id, sort ≥1}].\n• activate / deactivate — id.\nAvailability per branch follows the services inside the offer. Confirm the price math with the vendor.',
+        'Offers (عروض): several services sold together.\nACTIONS:\n• list — optional branch_id, active_only, q, page, per_page. • get — id (services with variants, service_pins).\n• create — name_ar, description_ar, section_id, service_ids, price_type: service (no discount) / free / discount (+ discount_percentage) / special (+ offer_price). service_price = sum of the included services (computed when omitted). Optional sub_service_ids (pin one variant per service; leave a service unpinned to let the customer choose), home delivery fields like services (home_hours = the full list).\n• update — id + any field; the rest is echoed. sub_service_ids changes only the services you pass ("" unpins one).\n• sort — items [{id, sort ≥1}].\n• activate / deactivate — id.\nAvailability per branch follows the services inside the offer. Confirm the price math with the vendor.',
       inputSchema: z.object({
         action: z.enum(['list', 'get', 'create', 'update', 'sort', 'activate', 'deactivate']),
         id: idLike.optional(),
@@ -1114,7 +1118,9 @@ export function buildTools(api: VendorClient): ToolDef[] {
             const current = await api.get(`/offers/${input.id}`);
             const serviceIds = input.service_ids?.length ? input.service_ids : (current?.services || []).map((sv: any) => sv.id);
             const pins = Object.fromEntries(
-              Object.entries(input.sub_service_ids ?? current?.service_pins ?? {}).filter(([, v]) => v !== null && v !== undefined && v !== ''),
+              Object.entries({ ...(current?.service_pins || {}), ...(input.sub_service_ids || {}) }).filter(
+                ([sid, v]) => v !== null && v !== undefined && v !== '' && serviceIds.map(String).includes(String(sid)),
+              ),
             );
             const type = input.price_type ?? current?.price_type ?? 'service';
             const servicePrice = input.service_price
@@ -1151,7 +1157,7 @@ export function buildTools(api: VendorClient): ToolDef[] {
     {
       name: 'employee',
       description:
-        'Employees (specialists).\nACTIONS:\n• list — filters: branch_id, q, active_only, exclude_busy, page, per_page. • get — id (hours, breaks, services, branches, invitation state).\n• create — first_name, email, phone, branch_id (one or several), role_id (role action="list"), official_hours [{day, start_time, end_time}]. The person gets an email invitation to join (no password is set; they sign in by email code after accepting). Optional: last_name, service_ids, break_hours, job_title, bio, salary, commission_type (none/fixed/percentage) + commission, commission_calculation_method (gross/net), start_date, end_date, is_manager (receives the branch\'s booking alerts and daily summary — not a permission).\n• update — id + any field; required fields, services, branches and commission are echoed. Changing email sends a new invitation.\n• resend_invitation — id (pending invitations only).\n• activate / deactivate — id (deactivated staff still count toward the plan limit).\n• set_busy — id + busy_from (+ optional busy_until) takes them off new bookings; available_when_busy=false also hides them. • clear_busy — id.\nConfirm every field with the vendor.',
+        'Employees (specialists).\nACTIONS:\n• list — filters: branch_id, q, active_only, exclude_busy, page, per_page. • get — id (hours, breaks, services, branches, invitation state).\n• create — first_name, email, phone, branch_id (one or several), role_id (role action="list"), official_hours [{day, start_time, end_time}] (the full week; on update it replaces the stored hours). The person gets an email invitation to join (no password is set; they sign in by email code after accepting). Optional: last_name, service_ids, break_hours, job_title, bio, salary, commission_type (none/fixed/percentage) + commission, commission_calculation_method (gross/net), start_date, end_date, is_manager (receives the branch\'s booking alerts and daily summary — not a permission).\n• update — id + any field; required fields, services, branches and commission are echoed. Changing email sends a new invitation.\n• resend_invitation — id (pending invitations only).\n• activate / deactivate — id (deactivated staff still count toward the plan limit).\n• set_busy — id + busy_from (+ optional busy_until) takes them off new bookings; available_when_busy=false also hides them. • clear_busy — id.\nConfirm every field with the vendor.',
       inputSchema: z.object({
         action: z.enum(['list', 'get', 'create', 'update', 'resend_invitation', 'activate', 'deactivate', 'set_busy', 'clear_busy']),
         id: idLike.optional(),

@@ -49,9 +49,7 @@ import { zodToJsonSchema } from './zod-to-jsonschema.js';
 
 const PORT = Number(process.env.PORT) || 3000;
 // Same host the OAuth login talks to, so a staging login never drives the production API.
-const VENDOR_API_BASE =
-  process.env.STREAMLINE_BASE ||
-  `${process.env.STREAMLINE_API_BASE || 'https://api.streamline.com.sa'}/vendor/v1`;
+const VENDOR_API_BASE = `${process.env.STREAMLINE_API_BASE || 'https://api.streamline.com.sa'}/vendor/v1`;
 const HOST = process.env.HOST || '0.0.0.0';
 
 const app = express();
