@@ -290,10 +290,11 @@ function cleanReply(text: string): string {
   // "think" in English in the open output (e.g. "The user wants…", "From `…`",
   // "I will answer in Najdi…") before giving the real answer. Clean Gemini
   // replies have none of these markers and pass through untouched.
+  const unwrap = (s: string) => s.replace(/`([^`\n]+)`/g, '$1');
   const narrated =
-    /`/.test(text) ||
+    /`[^`\n]*[(=][^`\n]*`/.test(text) ||
     /\b(i['’]?ll|i will|i need|let me|the user|i have all|from the|in the response|returned\s+\d|action\s*=|najdi|present this|here['’]?s|here is|the answer is|final answer|as follows)\b/i.test(text);
-  if (!narrated) return text;
+  if (!narrated) return unwrap(text);
   // Cut at the LAST English→Arabic hand-off: where the English reasoning ends
   // (a Latin letter … then `.`, `:` or newline) and the Arabic answer begins.
   // Internal English inside the answer (branch names like "30 Degrees") is
@@ -305,10 +306,10 @@ function cleanReply(text: string): string {
   while ((m = boundary.exec(text)) !== null) cut = m.index + m[0].length;
   if (cut > 0) {
     const answer = text.slice(cut).trim();
-    if (answer.length >= 4) return answer;
+    if (answer.length >= 4) return unwrap(answer);
   }
   // No clean hand-off found — strip backtick tool snippets and return.
-  return text.replace(/`[^`]*`/g, '').replace(/[ \t]{2,}/g, ' ').trim();
+  return unwrap(text.replace(/`[^`\n]*[(=][^`\n]*`/g, '')).replace(/[ \t]{2,}/g, ' ').trim();
 }
 
 /**
