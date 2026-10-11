@@ -326,6 +326,23 @@ app.post('/chat', async (req: Request, res: Response) => {
     }
   }
 
+  const stream = String(req.headers.accept || '').includes('text/event-stream');
+  let closed = false;
+  res.on('close', () => {
+    if (!res.writableEnded) closed = true;
+  });
+  const emit = (event: string, data: unknown) => {
+    if (stream && !closed) res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  };
+  const finish = (payload: unknown) => {
+    if (!res.headersSent) {
+      res.json(payload);
+      return;
+    }
+    emit('done', payload);
+    res.end();
+  };
+
   try {
     const api = new VendorClient({ token, baseURL: STREAMLINE_BASE });
     const lang = req.body?.lang === 'en' || req.body?.lang === 'tr' ? req.body.lang : 'ar';
@@ -338,6 +355,14 @@ app.post('/chat', async (req: Request, res: Response) => {
     if (note) {
       const at = messages.length - 1;
       messages[at] = { ...messages[at], content: `${messages[at].content}\n${note}` };
+    }
+    if (stream) {
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        'X-Accel-Buffering': 'no',
+      });
+      emit('step', { name: 'thinking' });
     }
     const tools = buildTools(api);
     const now = nowSaudi();
@@ -352,8 +377,10 @@ app.post('/chat', async (req: Request, res: Response) => {
       tools,
       messages,
       maxHops: MAX_HOPS,
+      onStep: (step) => emit('step', step),
+      isCancelled: () => closed,
     });
-    res.json({ ...result, usage: turn.usage, memory: turn.memory || undefined });
+    finish({ ...result, usage: turn.usage, memory: turn.memory || undefined });
   } catch (err: any) {
     const status = err?.response?.status;
     const gemError = err?.response?.data?.error;
@@ -363,7 +390,7 @@ app.post('/chat', async (req: Request, res: Response) => {
     );
     // Never surface a raw error/stack to the UI. Respond 200 with a gentle
     // line so the page shows a calm "try again" bubble, not a red 5xx.
-    res.json({
+    finish({
       reply: BUSY_REPLY,
       toolCalls: [],
       unavailable: true,

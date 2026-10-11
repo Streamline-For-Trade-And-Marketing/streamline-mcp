@@ -60,6 +60,7 @@ export interface GeminiChatResult {
   model?: string;
   /** True when every model in the rotation was rate-limited / unavailable. */
   exhausted?: boolean;
+  cancelled?: boolean;
 }
 
 /**
@@ -322,6 +323,8 @@ export async function runGeminiChat(opts: {
   tools: ToolDef[];
   messages: ChatMessage[];
   maxHops?: number;
+  onStep?: (step: { name: string; action?: string }) => void;
+  isCancelled?: () => boolean;
 }): Promise<GeminiChatResult> {
   const { apiKey, models, systemInstruction, tools } = opts;
   const maxHops = opts.maxHops ?? 8;
@@ -339,6 +342,9 @@ export async function runGeminiChat(opts: {
   const modelState = { idx: 0, last: models[0] };
 
   for (let hop = 0; hop < maxHops; hop++) {
+    if (opts.isCancelled?.()) {
+      return { reply: '', toolCalls, model: modelState.last, cancelled: true };
+    }
     const body = {
       system_instruction: { parts: [{ text: systemInstruction }] },
       contents,
@@ -387,6 +393,7 @@ export async function runGeminiChat(opts: {
       const name: string = p.functionCall.name;
       const args: Record<string, any> = p.functionCall.args ?? {};
       const tool = toolsByName.get(name);
+      opts.onStep?.({ name, action: typeof args.action === 'string' ? args.action : undefined });
 
       if (!tool) {
         toolCalls.push({ name, args, ok: false, error: 'unknown tool' });
