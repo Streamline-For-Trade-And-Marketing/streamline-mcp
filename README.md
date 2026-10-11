@@ -12,7 +12,7 @@ Two flavours ship from one repo:
 ## Tool surface (32 tools, action-based)
 
 - **Context:** `get_profile`, `get_current_time`, `get_wallet`, `get_reports`, `get_calendar`, `preview_booking`, `list_permissions`
-- **Bookings:** `booking` (list/get/create incl. per-service staff and products-only counter sales, cancel/complete/no-show status-only, approve/reject home requests, item_status, reschedule keeping each service's specialist, notes, set_customer, payment), `payment_link` (QR / pay-by-link)
+- **Bookings:** `booking` (list/get/create incl. per-service staff and products-only counter sales, cancel/complete/no-show status-only with an optional quiet mode, reopen (a completed booking reverses into confirmed with a credit note), approve/reject home requests, item_status, reschedule of the whole visit or single services, notes, set_customer, payment), `payment_link` (QR / pay-by-link)
 - **Catalogue:** `section`, `service`, `offer`, `product`, `bundle`, `promo_code`
 - **Team & access:** `employee` (invitations, busy windows), `employee_portfolio`, `role`
 - **Customers:** `customer`, `review`, `cancellation_reason`

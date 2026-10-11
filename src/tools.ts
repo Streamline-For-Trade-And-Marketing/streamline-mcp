@@ -1,5 +1,5 @@
 /**
- * Tool definitions (v0.8, synced with backend staging/main ad2f810 / 3f21f1f).
+ * Tool definitions (v0.9, synced with backend staging 0ec74be).
  *
  * One umbrella tool per resource with an `action` enum; every field is
  * optional at the zod layer and each handler checks what its action needs.
@@ -7,7 +7,7 @@
  */
 import { z } from 'zod';
 import { VendorClient } from './vendor-client.js';
-import { nowSaudi, saudiLocalToUnix } from './time.js';
+import { nowSaudi, saudiLocalToUnix, wallStringToUnix } from './time.js';
 
 // ════════════════════════════════════════════════════════════════════
 //  PUBLIC SHAPE
@@ -35,10 +35,19 @@ function clean<T extends Record<string, any>>(o: T): Record<string, any> {
   return out;
 }
 
-/** Advisory (never blocking) for actions on an already-completed booking. */
-function completedBookingNotice(detail: any, action: string): string | null {
+/** Advisory (never blocking) for bill changes on an already-completed booking. */
+function completedBookingNotice(detail: any): string | null {
   if (String(detail?.status ?? '').toLowerCase() !== 'completed') return null;
-  return `Booking #${detail?.id ?? '?'} is already completed and its invoice is issued. To ${action} it the backend issues a ZATCA credit/debit note against the original invoice (the original total stays frozen). Tell the vendor before confirming.`;
+  return `Booking #${detail?.id ?? '?'} was already completed with an issued invoice, so any change to its bill is recorded as a credit or debit note on that invoice. Tell the vendor.`;
+}
+
+function reversalNotice(detail: any, how: string): string {
+  return `Booking #${detail?.id ?? '?'} was completed, so ${how} reversed the sale: its invoice got a credit note (zeroed when the vendor is not on ZATCA), Streamline fees and cash wallet rows went to 0 (an online payment Streamline collected stays), and it is confirmed again. The customer was not messaged. Completing it again issues a new invoice.`;
+}
+
+/** Servers that reverse a completed sale also expose service_lines[].service_time. */
+function reversesSales(detail: any): boolean {
+  return Array.isArray(detail?.service_lines) && detail.service_lines.some((line: any) => line && 'service_time' in line);
 }
 
 function attachNotice(result: any, notice: string | null): any {
@@ -258,7 +267,7 @@ export function buildTools(api: VendorClient): ToolDef[] {
     {
       name: 'get_wallet',
       description:
-        'Wallet: `balance` (credits minus debits; with branch_id it is that branch\'s net) and transactions (value, type credit/debit, description, category, branch). Optional branch_id, page, per_page. Online-payment dues owed to the vendor are in online_payment action="payouts".',
+        'Wallet: `balance` (credits minus debits; with branch_id it is that branch\'s net), `platform_due` (online payments Streamline holds for the vendor, after refunds and payouts), `cash_fees` (Streamline fees on the vendor\'s bookings) and transactions (value, type credit/debit, description, branch, category: booking_revenue, booking_commission = Streamline fees, platform_collection, refund, refund_fee, payout, referral_platform_subsidy). Call the platform\'s cut "رسوم Streamline", never "عمولة" (that word is for staff commission). Optional branch_id, page, per_page. Payout dates are in online_payment action="payouts".',
       inputSchema: z.object({
         branch_id: idLike.optional(),
         page: z.number().int().min(1).optional(),
@@ -270,7 +279,7 @@ export function buildTools(api: VendorClient): ToolDef[] {
     {
       name: 'get_reports',
       description:
-        'Report numbers for a calendar period (it includes the rest of the period, so upcoming confirmed bookings count). period: day, week (Sun-Sat), month, 3months (quarter), 6months (half year), 9months, year. type:\n• home (default) — bookings_count, bookings_total_amount, customers_count, services_count, offers_count, employees_commissions, plus bookings_count_chart / bookings_value_chart [{x_key, value}] (x_key = hour for day, weekday 1=Sun for week, day of month for month, month number for longer periods). Note: these totals also count no-shows and unconfirmed bookings — say "حجوزات غير ملغاة" rather than "مكتملة".\n• services / offers / employees — top 10 by number of bookings.\n• customers — total, active %, new customers (by sign-up date), new %.\n• employees_commissions — commission per employee on completed bookings (optional employee_id).\nOptional branch_id. For exact paid revenue, sum completed bookings via booking action="list".',
+        'Report numbers for a calendar period (it includes the rest of the period, so upcoming confirmed bookings count). period: day, week (Sun-Sat), month, 3months (quarter), 6months (half year), 9months, year. type:\n• home (default) — bookings_count, bookings_total_amount, customers_count, services_count, offers_count, employees_commissions, plus bookings_count_chart / bookings_value_chart [{x_key, value}] (x_key = hour for day, weekday 1=Sun for week, day of month for month, month number for longer periods). Every report counts confirmed and completed bookings only (no-shows, unconfirmed and cancelled are left out) — say "حجوزات مؤكدة ومكتملة", not "مكتملة".\n• services / offers / employees — top 10 by number of bookings.\n• customers — total, active %, new customers (by sign-up date), new %.\n• employees_commissions — commission per employee on completed bookings (optional employee_id).\nOptional branch_id. For exact paid revenue, sum completed bookings via booking action="list".',
       inputSchema: z.object({
         type: z
           .enum(['home', 'services', 'offers', 'customers', 'employees', 'employees_commissions'])
@@ -286,7 +295,7 @@ export function buildTools(api: VendorClient): ToolDef[] {
     {
       name: 'get_calendar',
       description:
-        'Day view for one date (YYYY-MM-DD). Optional branch_id (omit = all branches) and employee_id. Returns employees (that weekday\'s hours, breaks, busy window), bookings (one row per employee segment: a multi-service visit split across specialists shows once per specialist with the same booking id), and external_busy (Google Calendar blocks). Cancelled bookings and products-only counter sales are not on the calendar. Pass raw=true for the unprocessed payload.',
+        'Day view for one date (YYYY-MM-DD). Optional branch_id (omit = all branches) and employee_id. Returns employees (that weekday\'s hours, breaks, busy window), bookings (one row per employee segment: a multi-service visit split across specialists shows once per specialist with the same booking id; customer_picked = the customer chose that specialist), and external_busy (Google Calendar events that block staff time; origin fresha/google; editable ones can be retimed with google_calendar action="reschedule_event", movable ones can also go to another employee). Cancelled bookings and products-only counter sales are not on the calendar. Pass raw=true for the unprocessed payload.',
       inputSchema: z.object({
         date: z.string().regex(datePattern),
         branch_id: idLike.optional(),
@@ -334,10 +343,25 @@ export function buildTools(api: VendorClient): ToolDef[] {
               home: b.is_home_service ? true : undefined,
               address: b.is_home_service ? b.customer_address : undefined,
               awaiting_approval: b.awaiting_approval ? true : undefined,
+              customer_picked: Array.isArray(b.customer_employee_choices) && b.customer_employee_choices.includes('specific') ? true : undefined,
               branch_id: b.branch_id,
             })),
           ),
-          external_busy: res?.external_busy || [],
+          external_busy: (res?.external_busy || []).map((e: any) => {
+            const editable = e.editable ?? true;
+            return clean({
+              employee_id: e.employee_id,
+              title: e.title,
+              start: at(e.start_time),
+              end: at(e.end_time),
+              origin: e.origin,
+              calendar: e.calendar_name,
+              calendar_id: editable ? e.calendar_id : undefined,
+              event_id: editable ? e.event_id : undefined,
+              editable: editable || undefined,
+              movable: editable && (e.movable ?? true) ? true : undefined,
+            });
+          }),
         };
       },
     },
@@ -345,7 +369,7 @@ export function buildTools(api: VendorClient): ToolDef[] {
     {
       name: 'preview_booking',
       description:
-        'Price, duration, free time slots and specialist options for a possible booking, without creating it (the POS calculator). Pass branch_id + service_ids / offer_ids / product_ids; optional employee_id, employee_assignments, any_employee, customer_id (applies their prepaid bundle), sub_service_ids, prices, durations, discount, promo_code. Without a cart it returns the branch catalogue (sections, offers, employees). Show the breakdown and offer to book, adjust or drop it.',
+        'Price, duration, free time slots and specialist options for a possible booking, without creating it (the POS calculator). Pass branch_id + service_ids / offer_ids / product_ids; optional employee_id, employee_assignments, any_employee, customer_id (applies their prepaid bundle), sub_service_ids, prices, durations, discount, promo_code (only checks a customer\'s code; vendor bookings take a manual discount). With local_datetime it skips the catalogue and free slots and returns suggested_assignments: a free specialist for every service sent without one at that time (off_shift = outside working hours; employee_id null = nobody free), plus line_minutes. Without a cart it returns the branch catalogue (sections, offers, employees). Show the breakdown and offer to book, adjust or drop it.',
       inputSchema: z.object({
         branch_id: idLike,
         employee_id: idLike.optional(),
@@ -361,13 +385,17 @@ export function buildTools(api: VendorClient): ToolDef[] {
         durations: idKeyedMap.optional(),
         discount: z.number().nonnegative().optional(),
         promo_code: z.string().optional(),
+        local_datetime: localDateTime.optional(),
       }),
-      handler: async (input) =>
-        api.post(
+      handler: async (input) => {
+        const { local_datetime, ...cart } = input;
+        const at = local_datetime ? { booking_timestamp: bookingTimestamp({ local_datetime }), preview_only: '1' } : {};
+        return api.post(
           '/pos',
-          clean({ ...input, any_employee: bool01(input.any_employee) }),
+          clean({ ...cart, ...at, any_employee: bool01(input.any_employee) }),
           { multipart: true },
-        ),
+        );
+      },
     },
 
     {
@@ -395,15 +423,17 @@ export function buildTools(api: VendorClient): ToolDef[] {
       description:
         'Bookings. ACTIONS:\n' +
         '• list — filters: branch_id, employee_id, customer_id, status (confirmed/completed/canceled/missed/not_confirmed), exclude_status[], date (YYYY-MM-DD) with optional date_to for a range, page, per_page.\n' +
-        '• get — id. `service_lines[]` holds one row per service (id, name, employee, start/end, status); `awaiting_approval` marks a pending home-service request.\n' +
-        '• create — branch_id + at least one of service_ids / offer_ids / product_ids. Staff for services/offers: employee_id (one specialist for all), or employee_assignments {"service:<service_id>" | "offer:<offer_id>:<service_id>" | "offer:<offer_id>": employee_id} (keys left out = any free specialist), or any_employee=true (may fail with "no specialist available"). Time: local_datetime (omit = now). Products only = a counter sale: no staff or time needed (employee_id = optional seller); it is rung up as completed unless complete=false. Optional: customer_id (omit = walk-in "عميل تلقائي", never ask for one the vendor didn\'t mention), sub_service_ids (REQUIRED for a service with variants: {"<service_id>": <sub_service_id>}), product_prices, prices / durations (per service id), offer_prices / offer_durations (per offer id), discount (flat SAR), notes, payment_way (cash; card payments go through payment_link), apply_bundles (default true: an active prepaid bundle of the customer covers matching lines), complete=true (ring up the sale now: completes it and marks it paid).\n' +
-        '• cancel / complete / mark_no_show — status only; lines, staff and prices stay. cancel takes optional cancellation_reason or cancel_reason_id.\n' +
+        '• get — id. `service_lines[]` holds one row per service (id, name, employee, start/end, status, price = its share of the bill; customer_employee_choice "specific" = the customer picked that specialist, keep them unless the vendor says otherwise); `canceled_amount` = cancelled services already taken off the bill; `awaiting_approval` marks a pending home-service request.\n' +
+        '• create — branch_id + at least one of service_ids / offer_ids / product_ids. Staff for services/offers: employee_id (one specialist for all), or employee_assignments {"service:<service_id>" | "offer:<offer_id>:<service_id>" | "offer:<offer_id>": employee_id} (keys left out = any free specialist), or any_employee=true (may fail with "no specialist available"). Time: local_datetime (omit = now). Products only = a counter sale: no staff or time needed (employee_id = optional seller); it is rung up as completed unless complete=false. Optional: customer_id (omit = walk-in "عميل تلقائي", never ask for one the vendor didn\'t mention), sub_service_ids (REQUIRED for a service with variants, on its own or inside an offer that leaves the variant open: {"<service_id>": <sub_service_id>}), product_prices, prices / durations (per service id), offer_prices / offer_durations (per offer id), discount (flat SAR), notes, payment_way (cash; card payments go through payment_link), apply_bundles (default true: an active prepaid bundle of the customer covers matching lines), complete=true (ring up the sale now: completes it and marks it paid).\n' +
+        '• cancel / complete / mark_no_show — status only; lines, staff and prices stay. cancel takes optional cancellation_reason or cancel_reason_id. Cancelling a COMPLETED booking reverses the sale instead (credit note on its invoice, back to confirmed, customer not messaged); a second cancel really cancels it.\n' +
+        '• reopen — back to confirmed: from cancelled or no-show (every service returns to pending), or from completed (reverses the sale as above; completing it again issues a new invoice).\n' +
         '• approve / reject — decide a pending home-service request (awaiting_approval=true); reject takes an optional reason shown to the customer. Never cancel or complete such a request.\n' +
-        '• item_status — one service of a visit: id + item_id (a service_lines id) + item_status (pending/completed/canceled/missed). The visit completes once every service is completed.\n' +
-        '• reschedule — id + local_datetime. Each service keeps its specialist unless employee_id (moves all services to one person) or item_employees {"<service_line_id>": employee_id}. Optional duration_minutes = new total length. The employee must work in the booking\'s branch.\n' +
-        '• update_notes — id + notes (≥3 chars); mode append (default replace).\n' +
+        '• item_status — one service of a visit: id + item_id (a service_lines id) + item_status (pending/completed/canceled/missed). A cancelled service leaves the bill (an offer re-splits its price over its other services); the visit closes once the rest are all completed. On a COMPLETED booking, setting a service to pending or missed reopens the whole booking and reverses its sale; cancelling one there credits just that service.\n' +
+        '• reschedule — id + local_datetime moves the whole visit: each service keeps its specialist and its place in the visit, unless employee_id (all services to one person, back to back) or item_employees {"<service_line_id>": employee_id}. item_times {"<service_line_id>": "HH:MM" or "YYYY-MM-DD HH:MM"} moves only those services, the rest stay put (no local_datetime needed). In an open visit, finished services keep their time: move the others with item_times (a fully completed booking still moves as a whole; never reopen just to move). Optional duration_minutes = new total length. The employee must work in the booking\'s branch.\n' +
+        '• update_notes — id + notes (3-5000 chars); mode append (default replace).\n' +
         '• set_customer — id + customer_id; omit customer_id to make it a walk-in. Not allowed once completed.\n' +
         '• payment — live gateway details of an online payment (card, status, refunds).\n' +
+        'The customer is messaged on cancel, complete, no-show, item_status, reschedule and set_customer; pass notify_customer=false when the vendor wants it done quietly.\n' +
         'A booking with a live QR payment request is locked (409) until that request is paid or cancelled — see the payment_link tool. Confirm every write with the vendor first.',
       inputSchema: z.object({
         action: z.enum([
@@ -413,6 +443,7 @@ export function buildTools(api: VendorClient): ToolDef[] {
           'cancel',
           'complete',
           'mark_no_show',
+          'reopen',
           'approve',
           'reject',
           'item_status',
@@ -445,7 +476,7 @@ export function buildTools(api: VendorClient): ToolDef[] {
         discount: z.number().nonnegative().optional(),
         local_datetime: localDateTime.optional(),
         booking_timestamp: z.number().int().optional(),
-        notes: z.string().optional(),
+        notes: z.string().max(5000).optional(),
         mode: z.enum(['append', 'replace']).optional(),
         payment_way: z.enum(['cash', 'online']).optional(),
         apply_bundles: z.boolean().optional(),
@@ -456,7 +487,9 @@ export function buildTools(api: VendorClient): ToolDef[] {
         item_id: idLike.optional(),
         item_status: z.enum(['pending', 'completed', 'canceled', 'missed']).optional(),
         item_employees: idKeyedMap.optional(),
+        item_times: z.record(z.string().regex(/^(\d{4}-\d{2}-\d{2} )?\d{1,2}:\d{2}$/)).optional(),
         duration_minutes: z.number().int().min(1).max(1440).optional(),
+        notify_customer: z.boolean().optional(),
       }),
       handler: async (input) => {
         const zatca = await api.getZatcaState();
@@ -538,16 +571,34 @@ export function buildTools(api: VendorClient): ToolDef[] {
           }
           case 'cancel':
           case 'complete':
-          case 'mark_no_show': {
+          case 'mark_no_show':
+          case 'reopen': {
             require(input, ['id'], input.action);
             const detail = await api.get(`/bookings/${input.id}`);
             if (detail?.awaiting_approval) {
               throw new Error('This is a pending home-service request — decide it with action="approve" or action="reject".');
             }
-            const notice = completedBookingNotice(
-              detail,
-              input.action === 'cancel' ? 'cancel' : input.action === 'complete' ? 're-complete' : 'mark as no-show',
-            );
+            const current = String(detail?.status ?? '');
+            const completed = current === 'completed';
+            const reversible = completed && reversesSales(detail);
+            if (input.action === 'reopen' || (input.action === 'cancel' && reversible)) {
+              if (!['completed', 'canceled', 'missed'].includes(current)) {
+                throw new Error(`Booking #${detail?.id ?? input.id} is ${current || 'open'}, so there is nothing to reopen.`);
+              }
+              if (completed && !reversible) {
+                throw new Error(`Booking #${detail?.id ?? input.id} can't be reversed here: cancel it instead (that credits its invoice).`);
+              }
+              const reopened = present(await statusOnly(input.id, { status: 'confirmed', ...(completed ? { notify_customer: '0' } : {}) }));
+              if (!completed) return reopened;
+              const how = input.action === 'cancel' ? 'cancelling it' : 'reopening it';
+              const next = input.action === 'cancel' ? ' To really cancel it, cancel it once more (pass the reason again).' : '';
+              return attachNotice(reopened, reversalNotice(detail, how) + next);
+            }
+            if (completed && input.action !== 'cancel') {
+              throw new Error(input.action === 'complete'
+                ? `Booking #${detail?.id ?? input.id} is already completed.`
+                : `Booking #${detail?.id ?? input.id} is completed: reopen it first (that reverses its invoice), then mark the no-show.`);
+            }
             const body: Record<string, any> = {
               status: input.action === 'cancel' ? 'canceled' : input.action === 'complete' ? 'completed' : 'missed',
             };
@@ -556,7 +607,8 @@ export function buildTools(api: VendorClient): ToolDef[] {
               if (input.cancellation_reason) body.cancellation_reason = input.cancellation_reason;
               if (input.cancel_reason_id) body.cancel_reason_id = input.cancel_reason_id;
             }
-            return attachNotice(present(await statusOnly(input.id, body)), notice);
+            if (input.notify_customer !== undefined) body.notify_customer = bool01(input.notify_customer);
+            return attachNotice(present(await statusOnly(input.id, body)), completedBookingNotice(detail));
           }
           case 'approve':
             require(input, ['id'], 'approve');
@@ -566,37 +618,73 @@ export function buildTools(api: VendorClient): ToolDef[] {
             return present(
               await api.post(`/bookings/${input.id}/reject`, clean({ reason: input.reason?.trim() }), { multipart: true }),
             );
-          case 'item_status':
+          case 'item_status': {
             require(input, ['id', 'item_id', 'item_status'], 'item_status');
-            return present(
-              await api.post(
-                `/bookings/${input.id}/items/${input.item_id}/status`,
-                { status: input.item_status },
-                { multipart: true },
-              ),
+            const detail = await api.get(`/bookings/${input.id}`);
+            const updated: any = await api.post(
+              `/bookings/${input.id}/items/${input.item_id}/status`,
+              clean({ status: input.item_status, notify_customer: bool01(input.notify_customer) }),
+              { multipart: true },
             );
+            const reopened = detail?.status === 'completed' && updated?.status && updated.status !== 'completed';
+            return attachNotice(
+              present(updated),
+              reopened ? reversalNotice(detail, `setting one of its services to ${input.item_status}`) : completedBookingNotice(detail),
+            );
+          }
           case 'reschedule': {
             require(input, ['id'], 'reschedule');
-            const timestamp = bookingTimestamp(input);
-            if (timestamp === undefined) {
-              throw new Error('action="reschedule" requires local_datetime.');
-            }
             const detail = await api.get(`/bookings/${input.id}`);
-            const body: Record<string, any> = { booking_timestamp: timestamp };
-            if (input.duration_minutes) body.duration_minutes = input.duration_minutes;
             const lines: any[] = Array.isArray(detail?.service_lines) ? detail.service_lines : [];
             const overrides = input.item_employees ?? {};
-            if (input.employee_id != null) {
-              body.employee_id = input.employee_id;
-            } else if (lines.length > 0 && lines.every((l) => l?.employee?.id || overrides[String(l.id)])) {
-              body.items = lines.map((l) => ({ id: l.id, employee_id: overrides[String(l.id)] ?? l.employee.id }));
-            } else {
-              body.employee_id = detail?.employee?.id ?? detail?.employee_id;
+            const moves = input.item_times ?? {};
+            const visitStart = wallStringToUnix(detail?.start_time);
+            const body: Record<string, any> = clean({ notify_customer: bool01(input.notify_customer) });
+            const known = new Set(lines.map((l) => String(l.id)));
+            const unknown = [...Object.keys(moves), ...Object.keys(overrides)].filter((id) => !known.has(id));
+            if (unknown.length > 0) {
+              throw new Error(`Unknown service_lines id(s): ${unknown.join(', ')} (use service_lines ids, not service ids). Read them with action="get".`);
             }
-            return attachNotice(
-              present(await api.post(`/bookings/${input.id}/reschedule`, body, { multipart: true })),
-              completedBookingNotice(detail, 'reschedule'),
-            );
+            if (Object.keys(moves).length > 0) {
+              if (input.local_datetime || input.booking_timestamp !== undefined || input.employee_id != null || input.duration_minutes) {
+                throw new Error('item_times moves single services only: drop local_datetime / employee_id / duration_minutes (use item_employees for a moved service\'s specialist), or move the whole visit in a separate call.');
+              }
+              if (visitStart === undefined) throw new Error('This booking has no start time to move from.');
+              const lineStart = (line: any, value: string) => {
+                const [date, time] = value.includes(' ')
+                  ? value.split(' ')
+                  : [String(line.start_time ?? detail.start_time).slice(0, 10), value];
+                return saudiLocalToUnix(date, time);
+              };
+              body.booking_timestamp = visitStart;
+              body.items = lines
+                .filter((l) => moves[String(l.id)] !== undefined || overrides[String(l.id)] !== undefined)
+                .map((l) => clean({
+                  id: l.id,
+                  start_time: moves[String(l.id)] !== undefined ? lineStart(l, moves[String(l.id)]) : undefined,
+                  employee_id: overrides[String(l.id)],
+                }));
+            } else {
+              const timestamp = bookingTimestamp(input);
+              if (timestamp === undefined) {
+                throw new Error('action="reschedule" requires local_datetime (or item_times to move single services).');
+              }
+              body.booking_timestamp = timestamp;
+              if (input.duration_minutes) body.duration_minutes = input.duration_minutes;
+              if (input.employee_id != null) {
+                body.employee_id = input.employee_id;
+              } else if (lines.length > 0 && lines.every((l) => l?.employee?.id || overrides[String(l.id)])) {
+                body.items = lines.map((l) => ({ id: l.id, employee_id: overrides[String(l.id)] ?? l.employee.id }));
+                const keepsLayout = lines.length > 1 && lines.every((l) => l?.start_time) && !input.duration_minutes
+                  && Object.keys(overrides).length === 0;
+                if (keepsLayout && visitStart !== undefined && detail?.status !== 'completed') {
+                  body.shift_seconds = timestamp - visitStart;
+                }
+              } else {
+                body.employee_id = detail?.employee?.id ?? detail?.employee_id;
+              }
+            }
+            return present(await api.post(`/bookings/${input.id}/reschedule`, body, { multipart: true }));
           }
           case 'update_notes': {
             require(input, ['id', 'notes'], 'update_notes');
@@ -605,12 +693,14 @@ export function buildTools(api: VendorClient): ToolDef[] {
               const detail = await api.get(`/bookings/${input.id}`);
               if (detail?.notes) notes = `${detail.notes}\n${notes}`;
             }
-            if (notes.length < 3) throw new Error('notes must be at least 3 characters.');
+            if (notes.length < 3 || notes.length > 5000) throw new Error('notes must be 3 to 5000 characters.');
             return present(await statusOnly(input.id, { notes }));
           }
           case 'set_customer':
             require(input, ['id'], 'set_customer');
-            return present(await statusOnly(input.id, { customer_id: input.customer_id ?? '' }));
+            return present(
+              await statusOnly(input.id, { customer_id: input.customer_id ?? '', ...clean({ notify_customer: bool01(input.notify_customer) }) }),
+            );
           case 'payment':
             require(input, ['id'], 'payment');
             return api.get(`/bookings/${input.id}/payment`);
@@ -1319,7 +1409,7 @@ export function buildTools(api: VendorClient): ToolDef[] {
     {
       name: 'customer',
       description:
-        'Customers.\nACTIONS:\n• list — q (name / phone / email), branch_id, page, per_page. By default only customers who booked with this vendor; all_records=true searches every registered customer (use it to find someone by phone before creating).\n• get — id.\n• create — first_name (≥2), phone (Saudi mobile, 05…); optional last_name, email, referral_channel (google/fresha/instagram/now_link/walk_in). A phone or email that already belongs to a customer is rejected — look them up with list all_records=true instead.\nUse the returned id as booking customer_id.',
+        'Customers.\nACTIONS:\n• list — q (name / part of the phone / email), branch_id, page, per_page: customers who booked with this vendor. all_records=true with q = a full Saudi mobile (05…, 9665…) finds a customer registered anywhere on Streamline by that number (names and partial numbers never reach other businesses\' customers).\n• get — id.\n• create — first_name (≥2), phone (Saudi mobile, 05…); optional last_name, email, referral_channel (google/fresha/instagram/now_link/walk_in). A mobile that is already registered returns that customer with already_registered=true instead of a new one; an email used by another customer is rejected.\nUse the returned id as booking customer_id.',
       inputSchema: z.object({
         action: z.enum(['list', 'get', 'create']),
         id: idLike.optional(),
@@ -1416,7 +1506,7 @@ export function buildTools(api: VendorClient): ToolDef[] {
     {
       name: 'invoice',
       description:
-        'Invoices (read-only). Every completed booking and bundle sale gets one; only ZATCA-active vendors send them to ZATCA.\nACTIONS:\n• list — filters: type (customer = to customers, vendor = platform invoices to the vendor), booking_id, q (exact invoice number), document_type (invoice/credit_note/debit_note; default invoice), page, per_page.\n• get — id; includes notes[] (credit/debit notes, newest first).\nFields: total/vat are the original issued amounts; net_total/net_vat include credit/debit notes — show net_total when present. zatca_status: pending/reported/cleared/rejected/failed; skipped = not sent to ZATCA.',
+        'Invoices (read-only). Every completed booking and bundle sale gets one; only ZATCA-active vendors send them to ZATCA. vendor-type invoices bill "رسوم Streamline" (the platform\'s fees), never call them commission.\nACTIONS:\n• list — filters: type (customer = to customers, vendor = platform invoices to the vendor), booking_id, q (part of the invoice number or the buyer\'s name), document_type (invoice/credit_note/debit_note; default invoice), page, per_page.\n• get — id; includes notes[] (credit/debit notes, newest first) and documents[] (the invoice and each note as printed: seller, buyer, lines, taxable, tax, total, reason).\nFields: total/vat are the original issued amounts; net_total/net_vat include credit/debit notes — show net_total when present. zatca_status: pending/reported/cleared/rejected/failed; skipped = not sent to ZATCA. zatca_overdue = still not accepted a day later (zatca_reason / zatca_message say why).',
       inputSchema: z.object({
         action: z.enum(['list', 'get']),
         id: idLike.optional(),
@@ -1443,9 +1533,14 @@ export function buildTools(api: VendorClient): ToolDef[] {
                 }),
               ),
             );
-          case 'get':
+          case 'get': {
             require(input, ['id'], 'get');
-            return api.get(`/invoices/${input.id}`);
+            const invoice = await api.get(`/invoices/${input.id}`);
+            if (Array.isArray(invoice?.documents)) {
+              invoice.documents = invoice.documents.map(({ qr, ...doc }: any) => doc);
+            }
+            return invoice;
+          }
         }
       },
     },
@@ -1762,55 +1857,78 @@ export function buildTools(api: VendorClient): ToolDef[] {
     {
       name: 'promo_code',
       description:
-        'Promo codes created by this account.\nACTIONS:\n• list — page, per_page. • get — id.\n• create — discount_type (percentage 0-100 / fixed SAR), value, start_date, end_date (after start), uses (≥1). Optional code (letters/digits, ≥5; generated when omitted).\n• update — id + code + any other field. The API always issues a code on edit, so pass the code to use from now on (a NEW unique one — the current code is rejected as taken). Tell the vendor the old code stops working. To keep a code unchanged, don\'t edit it — deactivate and create another instead.\n• activate / deactivate — id.',
+        'Promo codes customers enter at online checkout (this business only; bookings made here take a manual discount instead).\nACTIONS:\n• list — q (part of the code), page, per_page. Each row has status: active / scheduled (starts later) / inactive / used_up / expired, plus actual_uses and branches_count (0 = every branch).\n• get — id (+ its branches).\n• create — discount_type (percentage ≤100 / fixed SAR), value (>0), start_date, end_date (YYYY-MM-DD, end on or after start, not in the past). Optional: code (letters, digits, _ or -, ≤30; generated when omitted), uses (total; omit = unlimited), uses_per_customer, min_amount (subtotal needed), max_discount (cap for a percentage), branch_ids (omit = every branch), is_active (default on).\n• update — id + only what changes; the code stays unless a new one is passed. 0 removes a limit (uses, uses_per_customer, min_amount, max_discount); branch_ids [] = every branch. uses can\'t go below actual_uses.\n• activate / deactivate — id.',
       inputSchema: z.object({
         action: z.enum(['list', 'get', 'create', 'update', 'activate', 'deactivate']),
         id: idLike.optional(),
+        q: z.string().optional(),
         page: z.number().int().min(1).optional(),
         per_page: z.number().int().min(1).max(100).optional(),
-        code: z.string().min(5).regex(/^[A-Za-z0-9]+$/, 'Letters and digits only.').optional(),
+        code: z.string().max(30).regex(/^[A-Za-z0-9_-]+$/, 'Letters, digits, _ and - only.').optional(),
         discount_type: z.enum(['percentage', 'fixed']).optional(),
-        value: z.number().nonnegative().optional(),
+        value: z.number().positive().optional(),
         start_date: z.string().regex(datePattern).optional(),
         end_date: z.string().regex(datePattern).optional(),
-        uses: z.number().int().min(1).optional(),
+        uses: z.number().int().min(0).optional(),
+        uses_per_customer: z.number().int().min(0).optional(),
+        min_amount: z.number().nonnegative().optional(),
+        max_discount: z.number().nonnegative().optional(),
+        branch_ids: z.array(idLike).optional(),
+        is_active: z.boolean().optional(),
       }),
       handler: async (input) => {
+        const isoDay = (v: any) => {
+          const m = /^(\d{2})-(\d{2})-(\d{4})$/.exec(String(v ?? ''));
+          return m ? `${m[3]}-${m[2]}-${m[1]}` : v;
+        };
+        const view = (row: any) =>
+          row && typeof row === 'object' ? { ...row, start_date: isoDay(row.start_date), end_date: isoDay(row.end_date) } : row;
+        const conditions = () => {
+          const out: Record<string, any> = {};
+          for (const key of ['uses', 'uses_per_customer', 'min_amount', 'max_discount'] as const) {
+            if (input[key] !== undefined) out[key] = input[key]! > 0 ? input[key] : null;
+          }
+          if (input.branch_ids !== undefined) {
+            out.all_branches = input.branch_ids.length === 0;
+            out.branch_id = input.branch_ids;
+          }
+          if (input.is_active !== undefined) out.is_active = input.is_active ? '1' : '0';
+          return out;
+        };
         switch (input.action) {
           case 'list':
-            return pageOf(await api.getRaw('/promo-codes', clean({ page: input.page, per_page: input.per_page })));
+            return pageOf(await api.getRaw('/promo-codes', clean({ q: input.q, page: input.page, per_page: input.per_page })), view);
           case 'get':
             require(input, ['id'], 'get');
-            return api.get(`/promo-codes/${input.id}`);
+            return view(await api.get(`/promo-codes/${input.id}`));
           case 'create':
-            require(input, ['discount_type', 'value', 'start_date', 'end_date', 'uses'], 'create');
-            return api.post(
-              '/promo-codes',
-              clean({
-                code: input.code,
-                discount_type: input.discount_type,
-                value: input.value,
-                start_date: input.start_date,
-                end_date: input.end_date,
-                uses: input.uses,
+            require(input, ['discount_type', 'value', 'start_date', 'end_date'], 'create');
+            return view(
+              await api.post('/promo-codes', {
+                ...clean({
+                  code: input.code,
+                  discount_type: input.discount_type,
+                  value: input.value,
+                  start_date: input.start_date,
+                  end_date: input.end_date,
+                }),
+                ...conditions(),
               }),
-              { multipart: true },
             );
           case 'update': {
-            require(input, ['id', 'code'], 'update');
+            require(input, ['id'], 'update');
             const current = await api.get(`/promo-codes/${input.id}`);
-            const day = (v: any) => (typeof v === 'string' ? v.slice(0, 10) : v);
-            return api.putViaPost(
-              `/promo-codes/${input.id}`,
-              clean({
-                code: input.code,
-                discount_type: input.discount_type ?? current?.discount_type,
-                value: input.value ?? current?.value,
-                start_date: input.start_date ?? day(current?.start_date),
-                end_date: input.end_date ?? day(current?.end_date),
-                uses: input.uses ?? current?.uses,
+            return view(
+              await api.putViaPost(`/promo-codes/${input.id}`, {
+                ...clean({
+                  code: input.code,
+                  discount_type: input.discount_type ?? current?.discount_type,
+                  value: input.value ?? current?.value,
+                  start_date: input.start_date ?? isoDay(current?.start_date),
+                  end_date: input.end_date ?? isoDay(current?.end_date),
+                }),
+                ...conditions(),
               }),
-              { multipart: true },
             );
           }
           case 'activate':
@@ -2013,13 +2131,14 @@ export function buildTools(api: VendorClient): ToolDef[] {
     {
       name: 'google_calendar',
       description:
-        'Two-way Google Calendar sync (package feature google_calendar): bookings go to each employee\'s calendar, and busy Google events block booking slots.\nACTIONS:\n• status — connected, account email, sync_enabled, calendars, employees with their mapped calendar.\n• connect — returns a `url` the VENDOR opens to grant access (you can\'t do it for them). Each employee gets a calendar automatically.\n• disconnect — removes the connection and all mappings (confirm first).\n• update_settings — any of sync_enabled, default_calendar_id ("" clears), mappings {"<employee_id>": "<calendar_id>" or ""}.\n• create_calendar — name → new calendar id to map.\n• reschedule_event — move an EXTERNAL Google event (from get_calendar external_busy): calendar_id, event_id, start_time, end_time ("YYYY-MM-DD HH:MM" Saudi local), optional employee_id.\nA 400 "لم يتم ربط تقويم Google بعد" means run connect first.',
+        'Two-way Google Calendar sync (package feature google_calendar): bookings go to each employee\'s calendar, a booking moved or resized in Google comes back here, and busy Google events block booking slots.\nACTIONS:\n• status — connected, account email, sync_enabled, calendars (writable), all_calendars (incl. read-only), employees with their calendar and google_busy_calendar_ids.\n• connect — returns a `url` the VENDOR opens to grant access (you can\'t do it for them). Each employee gets a calendar automatically.\n• disconnect — removes the connection and all mappings (confirm first).\n• update_settings — any of sync_enabled, default_calendar_id ("" clears), mappings {"<employee_id>": "<calendar_id>" or ""}, busy_calendars {"<employee_id>": ["<calendar_id>", …]} (extra calendars, e.g. Fresha\'s, whose events block that employee; [] clears).\n• create_calendar — name → new calendar id to map.\n• reschedule_event — move an editable EXTERNAL event (from get_calendar external_busy): calendar_id, event_id, start_time, end_time ("YYYY-MM-DD HH:MM" Saudi local), optional employee_id moves a `movable` event into that employee\'s own calendar.\nA 400 "لم يتم ربط تقويم Google بعد" means run connect first.',
       inputSchema: z.object({
         action: z.enum(['status', 'connect', 'disconnect', 'update_settings', 'create_calendar', 'reschedule_event']),
         return_url: z.string().optional(),
         sync_enabled: z.boolean().optional(),
         default_calendar_id: z.string().max(255).optional(),
         mappings: idKeyedMap.optional(),
+        busy_calendars: z.record(z.array(z.string().max(255))).optional(),
         name: z.string().min(1).max(120).optional(),
         calendar_id: z.string().max(255).optional(),
         event_id: z.string().max(255).optional(),
@@ -2041,7 +2160,12 @@ export function buildTools(api: VendorClient): ToolDef[] {
             if (input.sync_enabled !== undefined) payload.sync_enabled = bool01(input.sync_enabled);
             if (input.default_calendar_id !== undefined) payload.default_calendar_id = input.default_calendar_id;
             if (input.mappings && Object.keys(input.mappings).length) payload.mappings = input.mappings;
-            if (!Object.keys(payload).length) throw new Error('update_settings needs sync_enabled, default_calendar_id or mappings.');
+            if (input.busy_calendars && Object.keys(input.busy_calendars).length) {
+              payload.busy_calendars = Object.fromEntries(
+                Object.entries(input.busy_calendars as Record<string, string[]>).map(([employeeId, ids]) => [employeeId, ids.length ? ids : '']),
+              );
+            }
+            if (!Object.keys(payload).length) throw new Error('update_settings needs sync_enabled, default_calendar_id, mappings or busy_calendars.');
             return api.putViaPost('/google-calendar/settings', payload, { multipart: true });
           }
           case 'create_calendar':
