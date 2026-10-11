@@ -50,7 +50,7 @@ const toolsByName = new Map(tools.map((t) => [t.name, t]));
 const server = new Server(
   {
     name: 'streamline-mcp',
-    version: '0.8.0',
+    version: '0.9.0',
   },
   {
     capabilities: {
